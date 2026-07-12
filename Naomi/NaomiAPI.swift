@@ -12,6 +12,19 @@ enum NaomiAPI {
         return URL(string: raw) ?? URL(string: defaultBase)!
     }
 
+    // Пропуск для доступа из большого мира (NAOMI_API_TOKEN на сервере).
+    // Дома по Wi-Fi сервер пускает и без него.
+    static var token: String {
+        UserDefaults.standard.string(forKey: "apiToken")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private static func authorize(_ req: inout URLRequest) {
+        if !token.isEmpty {
+            req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        }
+    }
+
     // ── История (GET /api/history) — общая с вебом и телеграмом ──
 
     private struct HistoryResponse: Decodable { let messages: [HistoryMessage] }
@@ -21,8 +34,9 @@ enum NaomiAPI {
     }
 
     static func history() async throws -> [ChatMessage] {
-        let url = base.appendingPathComponent("api/history")
-        let (data, _) = try await URLSession.shared.data(from: url)
+        var req = URLRequest(url: base.appendingPathComponent("api/history"))
+        authorize(&req)
+        let (data, _) = try await URLSession.shared.data(for: req)
         let parsed = try JSONDecoder().decode(HistoryResponse.self, from: data)
         return parsed.messages.map {
             ChatMessage(role: $0.role == "user" ? .user : .assistant, text: $0.content)
@@ -55,6 +69,7 @@ enum NaomiAPI {
                     var req = URLRequest(url: base.appendingPathComponent("api/chat"))
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    authorize(&req)
                     // Пауза между кадрами: сервер шлёт пульс каждые 15 сек, так что 120 — с запасом.
                     req.timeoutInterval = 120
                     let body = ["messages": [["role": "user", "content": text]]]

@@ -5,6 +5,7 @@ import SwiftUI
 struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("serverURL") private var serverURL = NaomiAPI.defaultBase
+    @AppStorage("apiToken") private var apiToken = ""
     var onSave: () -> Void = {}
 
     var body: some View {
@@ -19,6 +20,16 @@ struct SettingsSheet: View {
                     Text("Адрес сервера")
                 } footer: {
                     Text("Наоми живёт на Маке, приложение ходит к нему по домашнему Wi-Fi. Адрес — это имя Мака в сети: http://имя-мака.local:8787 (имя видно в macOS: Настройки → Основные → Общий доступ).")
+                }
+
+                Section {
+                    SecureField("токен из backend/.env", text: $apiToken)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                } header: {
+                    Text("Пропуск")
+                } footer: {
+                    Text("Нужен, когда Наоми открыта в интернет через туннель — значение NAOMI_API_TOKEN из backend/.env на Маке. Дома по Wi-Fi можно оставить пустым.")
                 }
 
                 Section {
