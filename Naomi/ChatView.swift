@@ -50,6 +50,11 @@ struct ChatView: View {
 
     // ── Лента ──
 
+    // Хвост ленты: прокрутка кодом целится в него, а пружина клампит контент по нему же —
+    // поэтому «дно» всегда одно и то же, и последний пузырь не заезжает в зону затемнения
+    // у поля ввода. Зазор «пузырь — поле» = высота хвоста + spacing стека.
+    private static let tailID = "chat-tail"
+
     private var messagesList: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -61,38 +66,35 @@ struct ChatView: View {
                         MessageBubble(message: msg)
                             .id(msg.id)
                     }
+                    Color.clear
+                        .frame(height: 6)
+                        .id(Self.tailID)
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 12)
-                // Нижнего отступа у ленты нет намеренно: весь зазор «последний пузырь —
-                // поле» живёт в верхнем отступе бара, поэтому он одинаков и когда скролл
-                // останавливается сам, и когда прокручиваем кодом (scrollTo прижимает
-                // пузырь ровно к краю ленты).
             }
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
             .trackNearBottom($isNearBottom, handScrolled: $scrolledAwayByHand)
             .onChange(of: messages.last?.text) {
-                if let last = messages.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
+                proxy.scrollTo(Self.tailID, anchor: .bottom)
             }
             .onChange(of: messages.count) { oldCount, _ in
-                guard let last = messages.last else { return }
+                guard !messages.isEmpty else { return }
                 if oldCount == 0 {
                     // Первичная загрузка истории: встаём на дно мгновенно, без «киносеанса»
                     // с прокруткой всей переписки. Тихая добивка — после ленивой разметки,
                     // чтобы дно было точным и клавиатурный подъезд не блокировался.
-                    proxy.scrollTo(last.id, anchor: .bottom)
+                    proxy.scrollTo(Self.tailID, anchor: .bottom)
                     Task { @MainActor in
                         try? await Task.sleep(for: .milliseconds(350))
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                        proxy.scrollTo(Self.tailID, anchor: .bottom)
                     }
                 } else {
                     // Отправка или новый ответ — единственный момент, когда чат едет вниз
                     // из любой глубины переписки.
                     withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                        proxy.scrollTo(Self.tailID, anchor: .bottom)
                     }
                 }
             }
@@ -104,7 +106,7 @@ struct ChatView: View {
                 // он хочет видеть найденное место, а не дно чата.
                 let kbH = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect)
                     .map { UIScreen.main.bounds.height - $0.origin.y } ?? -1
-                guard isNearBottom || !scrolledAwayByHand, kbH > 0, let last = messages.last else { return }
+                guard isNearBottom || !scrolledAwayByHand, kbH > 0, !messages.isEmpty else { return }
                 keyboardScroll?.cancel()
                 keyboardScroll = Task { @MainActor in
                     // Первый скролл — почти сразу, чтобы ехать ПАРАЛЛЕЛЬНО с клавиатурой
@@ -113,14 +115,14 @@ struct ChatView: View {
                     try? await Task.sleep(for: .milliseconds(60))
                     guard !Task.isCancelled else { return }
                     withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                        proxy.scrollTo(Self.tailID, anchor: .bottom)
                     }
                     // Тихая добивка после всех анимаций: если первый скролл попал точно —
                     // это пустой ход, если промахнулся на пиксели — мягко доводит.
                     try? await Task.sleep(for: .milliseconds(350))
                     guard !Task.isCancelled else { return }
                     withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                        proxy.scrollTo(Self.tailID, anchor: .bottom)
                     }
                 }
             }
@@ -165,7 +167,7 @@ struct ChatView: View {
             .disabled(!canSend)
         }
         .padding(.horizontal, 12)
-        .padding(.top, 16)      // зазор «последний пузырь — поле»: ровно такой же, как снизу
+        .padding(.top, 0)       // зазор «пузырь — поле» даёт хвост ленты (6 + spacing 10 = 16, как снизу)
         .padding(.bottom, 16)   // воздух между полем и клавиатурой — как в iMessage
     }
 
