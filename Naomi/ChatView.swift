@@ -184,40 +184,78 @@ struct ChatView: View {
         }
     }
 
+    // Ход Наоми рисуется слоями, как в вебе: живая плашка «что делаю» отдельным
+    // сообщением (название инструмента плавно меняется в одной строчке), затем
+    // финальный текст — своим пузырём. Плашка застывает галочкой, «думаю» без дел
+    // исчезает бесследно.
     private func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else { return }
         input = ""
         sending = true
         messages.append(ChatMessage(role: .user, text: text))
-        var reply = ChatMessage(role: .assistant, text: "")
-        reply.isStreaming = true
-        messages.append(reply)
-        let replyIndex = messages.count - 1
+
+        var status = ChatMessage(role: .assistant, text: "думаю…", kind: .action)
+        status.isLive = true
+        messages.append(status)
+        var statusIndex: Int? = messages.count - 1
+        var sawAction = false      // плашка показывала настоящий инструмент, не «думаю»
+        var replyIndex: Int? = nil // текущий текстовый пузырь этого хода
+
+        // Плашка отработала: с настоящим делом — застывает галочкой, пустое «думаю» — исчезает.
+        func freezeStatus() {
+            guard let i = statusIndex else { return }
+            if sawAction {
+                messages[i].isLive = false
+            } else {
+                messages.remove(at: i)
+                if let r = replyIndex, r > i { replyIndex = r - 1 }
+            }
+            statusIndex = nil
+        }
+
+        func appendReply(_ text: String, error: Bool = false) {
+            freezeStatus()
+            var reply = ChatMessage(role: .assistant, text: text)
+            reply.isStreaming = !error
+            reply.isError = error
+            messages.append(reply)
+            replyIndex = messages.count - 1
+        }
 
         Task {
             do {
                 for try await event in NaomiAPI.send(text) {
                     switch event {
                     case .delta(let piece):
-                        messages[replyIndex].text += piece
+                        if replyIndex == nil { appendReply("") }
+                        if let r = replyIndex { messages[r].text += piece }
                     case .action(let name):
-                        messages[replyIndex].actions.append(name)
+                        if let i = statusIndex {
+                            // та же строчка плавно меняет название дела
+                            sawAction = true
+                            withAnimation(.easeInOut(duration: 0.2)) { messages[i].text = name }
+                        } else {
+                            // новый слой действий после текста — новая плашка
+                            if let r = replyIndex { messages[r].isStreaming = false }
+                            replyIndex = nil
+                            var next = ChatMessage(role: .assistant, text: name, kind: .action)
+                            next.isLive = true
+                            messages.append(next)
+                            statusIndex = messages.count - 1
+                            sawAction = true
+                        }
                     case .silent:
-                        break   // сделала молча — ниже покажем галочку
+                        break   // сделала молча — застывшая плашка скажет сама
                     case .failure:
-                        messages[replyIndex].isError = true
-                        messages[replyIndex].text = "Что-то пошло не так. Попробуй ещё раз."
+                        appendReply("Что-то пошло не так. Попробуй ещё раз.", error: true)
                     }
                 }
-                if messages[replyIndex].text.isEmpty && !messages[replyIndex].isError {
-                    messages[replyIndex].text = "✓"   // молчаливое действие — как в вебе, без слов
-                }
+                freezeStatus()
             } catch {
-                messages[replyIndex].isError = true
-                messages[replyIndex].text = "Не дозвонилась до Наоми. Проверь Wi-Fi и что Мак не спит."
+                appendReply("Не дозвонилась до Наоми. Проверь Wi-Fi и что Мак не спит.", error: true)
             }
-            messages[replyIndex].isStreaming = false
+            if let r = replyIndex { messages[r].isStreaming = false }
             sending = false
         }
     }
@@ -268,17 +306,47 @@ struct MessageBubble: View {
     let message: ChatMessage
 
     var body: some View {
+        if message.kind == .action {
+            actionChip
+        } else {
+            textBubble
+        }
+    }
+
+    // Плашка «что Наоми делает»: спиннер пока живая, галочка — когда дело сделано.
+    private var actionChip: some View {
         HStack {
-            if message.role == .user { Spacer(minLength: 48) }
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(Array(message.actions.enumerated()), id: \.offset) { _, action in
-                    Label(action, systemImage: "gearshape.2")
-                        .font(.caption)
+            HStack(spacing: 7) {
+                if message.isLive {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.secondary)
+                } else {
+                    Image(systemName: "checkmark")
+                        .font(.caption2.weight(.bold))
                         .foregroundStyle(.secondary)
                 }
+                Text(message.text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .contentTransition(.opacity)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(Color.naomiBubble.opacity(0.55), in: Capsule())
+            Spacer(minLength: 48)
+        }
+    }
+
+    private var textBubble: some View {
+        HStack {
+            if message.role == .user { Spacer(minLength: 48) }
+            Group {
                 if message.text.isEmpty && message.isStreaming {
-                    TypingDots()
-                } else if !message.text.isEmpty {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.secondary)
+                } else {
                     Text(markdownText)
                         .font(.body)
                         .foregroundStyle(message.role == .user ? .white : Color.primary)
@@ -301,29 +369,6 @@ struct MessageBubble: View {
             markdown: message.text,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )) ?? AttributedString(message.text)
-    }
-}
-
-// Три точки «Наоми печатает…»
-struct TypingDots: View {
-    @State private var phase = 0
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(0..<3, id: \.self) { i in
-                Circle()
-                    .fill(Color.secondary)
-                    .frame(width: 6, height: 6)
-                    .opacity(phase == i ? 1 : 0.3)
-            }
-        }
-        .padding(.vertical, 4)
-        .task {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(300))
-                phase = (phase + 1) % 3
-            }
-        }
     }
 }
 

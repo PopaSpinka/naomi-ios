@@ -3,17 +3,22 @@ import Foundation
 
 struct ChatMessage: Identifiable, Equatable {
     enum Role { case user, assistant }
+    // Обычный пузырь с текстом или служебная плашка «что Наоми делает прямо сейчас».
+    // Плашки живут только в живом ходе — история с сервера их не хранит (как веб после F5).
+    enum Kind { case text, action }
 
     let id: UUID
     let role: Role
+    let kind: Kind
     var text: String
-    var actions: [String] = []   // плашки действий Наоми («включаю кондиционер» и т.п.)
     var isStreaming = false      // ответ ещё капает по буквам
     var isError = false          // не дозвонились / сервер ответил ошибкой
+    var isLive = false           // плашка действия ещё крутится (спиннер); застыла — галочка
 
-    init(role: Role, text: String) {
+    init(role: Role, text: String, kind: Kind = .text) {
         self.id = UUID()
         self.role = role
+        self.kind = kind
         self.text = text
     }
 }
