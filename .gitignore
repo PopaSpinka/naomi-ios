@@ -1,0 +1,10 @@
+# Личное состояние Xcode (позиции окон, схемы пользователя) — не для репозитория
+xcuserdata/
+*.xcuserstate
+
+# Сборочный мусор
+DerivedData/
+build/
+
+# macOS
+.DS_Store
