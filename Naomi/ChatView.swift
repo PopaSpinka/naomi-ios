@@ -1,5 +1,14 @@
 // Экран чата — как веб-вкладка, один в один: лента пузырей сверху, поле ввода снизу.
 import SwiftUI
+import PhotosUI
+
+// Фото, выбранное к отправке: миниатюра на руках сразу, загрузка на склад — в фоне.
+struct PendingAttachment: Identifiable {
+    let id = UUID()
+    var thumb: UIImage?
+    var uploaded: NaomiAPI.UploadedAttachment?   // nil — ещё едет на сервер
+    var failed = false                           // не доехало: ⚠️ на миниатюре, убрать крестиком
+}
 
 struct ChatView: View {
     // Холодный старт — сразу со слепком с телефона: чат виден мгновенно,
@@ -27,42 +36,72 @@ struct ChatView: View {
     // новая высота применяется к ленте на следующем проходе разметки, мгновенный
     // scrollTo целился по старым размерам и не двигал чат (отставание на строку).
     @State private var barGrowScroll: Task<Void, Never>?
+    // Вложения: выбор из фотоплёнки, очередь к отправке, открытое на весь экран фото.
+    @State private var pickedItems: [PhotosPickerItem] = []
+    @State private var pendingAtts: [PendingAttachment] = []
+    @State private var lightbox: LightboxItem?
+    // Заставка на холодном старте: прячет, как чат встаёт на место (уловка Claude).
+    @State private var showSplash = true
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                // Фон на весь экран, включая зону за клавиатурой — чтобы при её появлении
-                // за скруглёнными углами просвечивал интерфейс, а не чёрный провал (как в iMessage).
-                Color.naomiBg.ignoresSafeArea()
-                messagesList
-            }
-            // Поле ввода не отрезает ленту, а плавает над ней как системный бар: сообщения
-            // проезжают под него и под клавиатуру, а система рисует под баром тот же
-            // эффект «в размытие и затемнение», что и под шапкой (iOS 26).
-            .floatingInputBar { inputBar }
-            .navigationTitle("Наоми")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showSettings = true } label: {
-                        Image(systemName: "gearshape")
+        ZStack {
+            NavigationStack {
+                ZStack {
+                    // Фон на весь экран, включая зону за клавиатурой — чтобы при её появлении
+                    // за скруглёнными углами просвечивал интерфейс, а не чёрный провал (как в iMessage).
+                    Color.naomiBg.ignoresSafeArea()
+                    messagesList
+                }
+                // Поле ввода не отрезает ленту, а плавает над ней как системный бар: сообщения
+                // проезжают под него и под клавиатуру, а система рисует под баром тот же
+                // эффект «в размытие и затемнение», что и под шапкой (iOS 26).
+                .floatingInputBar { inputBar }
+                .navigationTitle("Наоми")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button { showSettings = true } label: {
+                            Image(systemName: "gearshape")
+                        }
+                        .tint(.primary)
                     }
-                    .tint(.primary)
+                }
+                .sheet(isPresented: $showSettings) {
+                    SettingsSheet { Task { await loadHistory() } }
+                }
+                .fullScreenCover(item: $lightbox) { item in
+                    LightboxView(rel: item.rel)
                 }
             }
-            .sheet(isPresented: $showSettings) {
-                SettingsSheet { Task { await loadHistory() } }
+
+            // Заставка холодного старта (уловка Claude): пока под ней чат встаёт на
+            // место, наверху — спокойная надпись; тает — а всё уже готово. Клавиатура
+            // (она в системном слое выше приложения) выезжает поверх с родной анимацией.
+            if showSplash {
+                splash
+                    .zIndex(1)
             }
         }
         .task {
-            // Клавиатура открыта сразу, как в мессенджерах: запустил — и печатай.
-            // Микро-пауза, чтобы фокус лёг после первой разметки экрана.
+            // «Визитку» держит только системный launch screen. Наша копия заставки
+            // лишь бесшовно перехватывает его на первом кадре и сразу тает,
+            // одновременно выезжает клавиатура. Микро-пауза — на первую разметку
+            // чата за заставкой, глазу она не видна.
             Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(80))
+                try? await Task.sleep(for: .milliseconds(20))
+                withAnimation(.easeOut(duration: 0.60)) { showSplash = false }
                 inputFocused = true
             }
             await loadHistory()
         }
+    }
+
+    // Экран-заставка: чистый тёплый фон, без надписи — бесшовно продолжает
+    // системный launch screen (он такого же цвета) и тает над готовым интерфейсом.
+    private var splash: some View {
+        Color.naomiBg
+            .ignoresSafeArea()
+            .transition(.opacity)
     }
 
     // ── Лента ──
@@ -84,7 +123,7 @@ struct ChatView: View {
                         errorCard(loadError)
                     }
                     ForEach(messages) { msg in
-                        MessageBubble(message: msg)
+                        MessageBubble(message: msg, onTapImage: { lightbox = LightboxItem(rel: $0) })
                             .id(msg.id)
                     }
                     Color.clear
@@ -197,23 +236,40 @@ struct ChatView: View {
     // ── Поле ввода ──
 
     private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextField("Напиши Наоми…", text: $input, axis: .vertical)
-                .lineLimit(1...5)
-                .focused($inputFocused)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .inputGlassBackground()
-
-            Button(action: send) {
-                Image(systemName: "arrow.up")
-                    .font(.body.weight(.bold))
-                    .foregroundStyle(canSend ? Color.primary : Color.secondary)
-                    .frame(width: 38, height: 38)
-                    .background(Color.naomiBubble.opacity(canSend ? 1 : 0.55))
-                    .clipShape(Circle())
+        VStack(spacing: 8) {
+            // Очередь фото к отправке: миниатюры с крестиком, пока едут — спиннер.
+            if !pendingAtts.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(pendingAtts) { att in
+                            pendingThumb(att)
+                        }
+                    }
+                    .padding(.top, 6)   // воздух под крестики
+                    .padding(.horizontal, 2)
+                }
             }
-            .disabled(!canSend)
+
+            HStack(alignment: .bottom, spacing: 10) {
+                // «+» — добавить фото из плёнки. 42 = высота поля в одну строку
+                // (строка ~22 + отступы 10+10) — кнопка и поле стоят вровень.
+                PhotosPicker(selection: $pickedItems, maxSelectionCount: 4, matching: .images) {
+                    Image(systemName: "plus")
+                        .font(.body.weight(.bold))
+                        .foregroundStyle(Color.primary)
+                        .frame(width: 42, height: 42)
+                        .sendGlassBackground()
+                }
+                .onChange(of: pickedItems) { _, items in
+                    guard !items.isEmpty else { return }
+                    pickedItems = []
+                    for item in items {
+                        Task { await addAttachment(item) }
+                    }
+                }
+
+                textFieldWithSend
+            }
         }
         .padding(.horizontal, 12)
         .padding(.top, 0)       // зазор «пузырь — поле» даёт хвост ленты (14 + spacing 12 = 26)
@@ -221,8 +277,106 @@ struct ChatView: View {
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { barHeight = $0 }
     }
 
+    // Поле ввода с кнопкой отправки внутри пузыря.
+    private var textFieldWithSend: some View {
+        TextField("Напиши Наоми…", text: $input, axis: .vertical)
+            .lineLimit(1...5)
+            .focused($inputFocused)
+            .padding(.leading, 14)
+            .padding(.trailing, 46)   // место под кнопку внутри пузыря
+            .padding(.vertical, 10)
+            .inputGlassBackground()
+            // Кнопка отправки внутри пузыря, справа. Пока отправлять нечего — её нет;
+            // с первым символом или выбранным фото мягко вырастает из ничего.
+            // При одной строке стоит по центру, при росте поля прижимается к низу.
+            .overlay(alignment: .bottomTrailing) {
+                if hasDraft {
+                    sendButton(size: 32, font: .subheadline)
+                        .padding(5)   // (42 − 32) / 2 — вровень с полем в одну строку
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .animation(.snappy(duration: 0.25), value: hasDraft)
+    }
+
+    // Черновик не пуст: есть текст или фото — есть что отправлять.
+    private var hasDraft: Bool { !input.isEmpty || !pendingAtts.isEmpty }
+
+    // Миниатюра фото в очереди: пока едет на склад — полупрозрачная со спиннером.
+    private func pendingThumb(_ att: PendingAttachment) -> some View {
+        ZStack(alignment: .topTrailing) {
+            Group {
+                if let t = att.thumb {
+                    Image(uiImage: t).resizable().scaledToFill()
+                } else {
+                    Color.naomiBubble
+                }
+            }
+            .frame(width: 64, height: 64)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .opacity(att.uploaded == nil ? 0.55 : 1)
+            .overlay {
+                if att.failed {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                } else if att.uploaded == nil {
+                    ProgressView()
+                }
+            }
+
+            Button {
+                pendingAtts.removeAll { $0.id == att.id }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.body)
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(.white, .black.opacity(0.55))
+            }
+            .offset(x: 6, y: -6)
+        }
+    }
+
+    // Выбранное в плёнке фото: миниатюра сразу в очередь, загрузка на склад — фоном.
+    private func addAttachment(_ item: PhotosPickerItem) async {
+        guard let data = try? await item.loadTransferable(type: Data.self) else { return }
+        let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
+        let filename = "IMG_\(Int(Date().timeIntervalSince1970 * 1000)).\(ext)"
+        let thumb = await UIImage(data: data)?.byPreparingThumbnail(ofSize: CGSize(width: 400, height: 400))
+        let pending = PendingAttachment(thumb: thumb)
+        pendingAtts.append(pending)
+        do {
+            let up = try await NaomiAPI.upload(data: data, filename: filename)
+            guard let i = pendingAtts.firstIndex(where: { $0.id == pending.id }) else { return }
+            pendingAtts[i].uploaded = up
+            // Семя кэша миниатюр: фото уже на руках, из сети не перетягивать.
+            if let thumb { RemoteImage.seed(rel: up.name, image: thumb) }
+        } catch {
+            // Не доехало до склада: миниатюра остаётся с ⚠️ (убрать — крестиком),
+            // отправка заблокирована, причина — в консоли Xcode.
+            print("Наоми: загрузка фото не удалась:", error)
+            if let i = pendingAtts.firstIndex(where: { $0.id == pending.id }) {
+                pendingAtts[i].failed = true
+            }
+        }
+    }
+
     private var canSend: Bool {
-        !sending && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasText = !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let uploading = pendingAtts.contains { $0.uploaded == nil }
+        return !sending && !uploading && (hasText || !pendingAtts.isEmpty)
+    }
+
+    // Кнопка отправки: стеклянный круг со стрелкой. Одна и та же в двух местах
+    // (рядом с полем и внутри пузыря), отличается только размером.
+    private func sendButton(size: CGFloat, font: Font) -> some View {
+        Button(action: send) {
+            Image(systemName: "arrow.up")
+                .font(font.weight(.bold))
+                .foregroundStyle(canSend ? Color.primary : Color.secondary)
+                .frame(width: size, height: size)
+                .sendGlassBackground()
+        }
+        .disabled(!canSend)
     }
 
     // ── Работа с сервером ──
@@ -248,7 +402,9 @@ struct ChatView: View {
     }
 
     private func sameConversation(_ a: [ChatMessage], _ b: [ChatMessage]) -> Bool {
-        a.count == b.count && zip(a, b).allSatisfy { $0.role == $1.role && $0.text == $1.text }
+        a.count == b.count && zip(a, b).allSatisfy {
+            $0.role == $1.role && $0.text == $1.text && $0.files == $1.files
+        }
     }
 
     // Ход Наоми рисуется слоями, как в вебе: живая плашка «что делаю» отдельным
@@ -260,10 +416,14 @@ struct ChatView: View {
     // отставание от живого стрима, зато рваность спрятана полностью.
     private func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !sending else { return }
+        let atts = pendingAtts.compactMap { $0.uploaded }
+        guard canSend, !text.isEmpty || !atts.isEmpty else { return }
         input = ""
+        pendingAtts = []
         sending = true
-        messages.append(ChatMessage(role: .user, text: text))
+        var userMsg = ChatMessage(role: .user, text: text)
+        userMsg.files = atts.map(\.name)
+        messages.append(userMsg)
 
         var chipID: UUID? = nil      // активная плашка дела
         var replyID: UUID? = nil     // растущий текстовый пузырь
@@ -327,9 +487,20 @@ struct ChatView: View {
             replyID = reply.id
         }
 
+        // Файл от Наоми: миниатюра в текущий ответ, а без него — отдельным рядом.
+        func showFile(_ rel: String) {
+            if let r = index(replyID) {
+                messages[r].files.append(rel)
+            } else {
+                var m = ChatMessage(role: .assistant, text: "")
+                m.files = [rel]
+                messages.append(m)
+            }
+        }
+
         func showAction(_ name: String) {
             if let r = index(replyID) {
-                if received.isEmpty {
+                if received.isEmpty && messages[r].files.isEmpty {
                     messages.remove(at: r)       // дело пришло раньше букв — палочку убираем без следа
                 } else {
                     messages[r].text = received  // текст перед делом — долить целиком и застыть
@@ -350,7 +521,7 @@ struct ChatView: View {
         func fail(_ text: String) {
             if let c = index(chipID) { messages[c].isLive = false }
             if let r = index(replyID) {
-                if received.isEmpty { messages.remove(at: r) }
+                if received.isEmpty && messages[r].files.isEmpty { messages.remove(at: r) }
                 else { messages[r].isStreaming = false }
             }
             chipID = nil; replyID = nil
@@ -361,13 +532,15 @@ struct ChatView: View {
 
         Task { @MainActor in
             do {
-                for try await event in NaomiAPI.send(text) {
+                for try await event in NaomiAPI.send(text, attachments: atts) {
                     switch event {
                     case .delta(let piece):
                         if replyID == nil { startReply() }
                         received += piece
                     case .action(let name):
                         showAction(name)
+                    case .file(let rel):
+                        showFile(rel)
                     case .silent:
                         break   // сделала молча — застывшая плашка скажет сама
                     case .failure:
@@ -382,8 +555,10 @@ struct ChatView: View {
             }
             await typewriter.value        // дать словам дотечь
             if let r = index(replyID) {
-                if received.isEmpty {
+                if received.isEmpty && messages[r].files.isEmpty {
                     messages.remove(at: r)   // тихий ход — палочка исчезает без следа
+                } else if received.isEmpty {
+                    messages[r].isStreaming = false   // только фото, без букв — палочку гасим
                 } else {
                     messages[r].text = received
                     // Ждём, пока волна последнего слова доиграет (0.35 с), и застываем.
@@ -434,6 +609,17 @@ private extension View {
             self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22))
         } else {
             self.background(Color.naomiBubble, in: RoundedRectangle(cornerRadius: 22))
+        }
+    }
+
+    // Кнопка отправки — то же стекло, круглая; interactive даёт родной отклик
+    // на нажатие (блик и продавливание, как у системных стеклянных кнопок).
+    @ViewBuilder
+    func sendGlassBackground() -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular.interactive(), in: Circle())
+        } else {
+            self.background(Color.naomiBubble, in: Circle())
         }
     }
 
@@ -488,6 +674,7 @@ private extension View {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    var onTapImage: (String) -> Void = { _ in }
 
     var body: some View {
         switch message.kind {
@@ -538,12 +725,20 @@ struct MessageBubble: View {
         if message.role == .user {
             HStack {
                 Spacer(minLength: 48)
-                Text(markdownText)
-                    .font(.body)
-                    .foregroundStyle(Color.primary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(Color.naomiBubble, in: RoundedRectangle(cornerRadius: 18))
+                VStack(alignment: .trailing, spacing: 6) {
+                    // Фото — голыми миниатюрами над пузырём текста (как в мессенджерах).
+                    if !message.files.isEmpty {
+                        MsgAttachments(files: message.files, onTapImage: onTapImage)
+                    }
+                    if !message.text.isEmpty {
+                        Text(markdownText)
+                            .font(.body)
+                            .foregroundStyle(Color.primary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(Color.naomiBubble, in: RoundedRectangle(cornerRadius: 18))
+                    }
+                }
             }
         } else {
             // Текст от края до края: слева — где раньше была граница пузыря,
@@ -551,25 +746,32 @@ struct MessageBubble: View {
             // Живой ход: пока букв нет — на месте будущей первой буквы пульсирует
             // палочка; перед первой буквой она схлопывается в себя (pillarCollapsed
             // взводит пейсинг), и текст рождается ровно на её месте, без отступов.
-            Group {
-                if message.isStreaming && message.text.isEmpty {
-                    // Невидимая «буква» держит высоту ряда ровно как у первой строки
-                    // будущего текста (тот же шрифт, те же отступы) — при подмене
-                    // палочки на текст чат не сдвигается ни на пиксель.
-                    Text(" ")
-                        .hidden()
-                        .overlay(alignment: .leading) {
-                            PulsingPillar(collapsed: message.pillarCollapsed)
+            VStack(alignment: .leading, spacing: 6) {
+                if !message.files.isEmpty {
+                    MsgAttachments(files: message.files, onTapImage: onTapImage)
+                }
+                if message.isStreaming || !message.text.isEmpty {
+                    Group {
+                        if message.isStreaming && message.text.isEmpty {
+                            // Невидимая «буква» держит высоту ряда ровно как у первой
+                            // строки будущего текста (тот же шрифт, те же отступы) —
+                            // при подмене палочки на текст чат не сдвигается ни на пиксель.
+                            Text(" ")
+                                .hidden()
+                                .overlay(alignment: .leading) {
+                                    PulsingPillar(collapsed: message.pillarCollapsed)
+                                }
+                        } else if #available(iOS 18.0, *), message.isStreaming {
+                            FadeInText(text: message.text)   // слова проявляются волной
+                        } else {
+                            Text(markdownText)
                         }
-                } else if #available(iOS 18.0, *), message.isStreaming {
-                    FadeInText(text: message.text)   // слова проявляются волной
-                } else {
-                    Text(markdownText)
+                    }
+                    .font(.body)
+                    .foregroundStyle(Color.primary)
+                    .opacity(message.isError ? 0.7 : 1)
                 }
             }
-            .font(.body)
-            .foregroundStyle(Color.primary)
-            .opacity(message.isError ? 0.7 : 1)
             .padding(.vertical, 4)
             .frame(maxWidth: .infinity, alignment: .leading)
         }

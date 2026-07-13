@@ -11,6 +11,7 @@ struct ChatMessage: Identifiable, Equatable {
     let role: Role
     let kind: Kind
     var text: String
+    var files: [String] = []     // вложения: относительные пути на складе сервера
     var isStreaming = false      // ответ ещё капает по буквам
     var isError = false          // не дозвонились / сервер ответил ошибкой
     var isLive = false           // плашка действия ещё крутится (спиннер); застыла — галочка

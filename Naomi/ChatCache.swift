@@ -14,6 +14,7 @@ enum ChatCache {
     private struct StoredMessage: Codable {
         let role: String
         let text: String
+        let files: [String]?
     }
 
     static func load() -> [ChatMessage] {
@@ -21,16 +22,22 @@ enum ChatCache {
               let stored = try? JSONDecoder().decode([StoredMessage].self, from: data)
         else { return [] }
         return stored.map {
-            ChatMessage(role: $0.role == "user" ? .user : .assistant, text: $0.text)
+            var m = ChatMessage(role: $0.role == "user" ? .user : .assistant, text: $0.text)
+            m.files = $0.files ?? []
+            return m
         }
     }
 
     static func save(_ messages: [ChatMessage]) {
-        // Только текст переписки: плашки дел, «думаю» и ошибки — живое, в слепок не идут.
+        // Только переписка (текст и фото): плашки дел и ошибки — живое, в слепок не идут.
         let stored = messages
-            .filter { $0.kind == .text && !$0.isError && !$0.text.isEmpty }
+            .filter { $0.kind == .text && !$0.isError && (!$0.text.isEmpty || !$0.files.isEmpty) }
             .suffix(limit)
-            .map { StoredMessage(role: $0.role == .user ? "user" : "assistant", text: $0.text) }
+            .map { StoredMessage(
+                role: $0.role == .user ? "user" : "assistant",
+                text: $0.text,
+                files: $0.files.isEmpty ? nil : $0.files
+            ) }
         guard let data = try? JSONEncoder().encode(Array(stored)) else { return }
         try? data.write(to: fileURL, options: .atomic)
     }
