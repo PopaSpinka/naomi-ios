@@ -2,7 +2,9 @@
 import SwiftUI
 
 struct ChatView: View {
-    @State private var messages: [ChatMessage] = []
+    // Холодный старт — сразу со слепком с телефона: чат виден мгновенно,
+    // сеть догоняет в фоне (loadHistory) и тихо обновляет, если что-то изменилось.
+    @State private var messages: [ChatMessage] = ChatCache.load()
     @State private var input = ""
     @State private var sending = false
     @State private var loadError: String?
@@ -18,6 +20,13 @@ struct ChatView: View {
     // «у дна» на холодном старте даёт ложное «нет» из-за ленивой разметки, поэтому
     // блокируем клавиатурный подъезд только по СОЧЕТАНИЮ: далеко от дна И листал сам.
     @State private var scrolledAwayByHand = false
+    // Высота поля ввода: когда оно растёт (перенос строки), лента едет вверх,
+    // чтобы последний пузырь не накрывало.
+    @State private var barHeight: CGFloat = 0
+    // Отложенная прокрутка под рост поля — та же схема, что у клавиатуры:
+    // новая высота применяется к ленте на следующем проходе разметки, мгновенный
+    // scrollTo целился по старым размерам и не двигал чат (отставание на строку).
+    @State private var barGrowScroll: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -38,14 +47,22 @@ struct ChatView: View {
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
                     }
-                    .tint(.naomiAccent)
+                    .tint(.primary)
                 }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsSheet { Task { await loadHistory() } }
             }
         }
-        .task { await loadHistory() }
+        .task {
+            // Клавиатура открыта сразу, как в мессенджерах: запустил — и печатай.
+            // Микро-пауза, чтобы фокус лёг после первой разметки экрана.
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(80))
+                inputFocused = true
+            }
+            await loadHistory()
+        }
     }
 
     // ── Лента ──
@@ -58,7 +75,11 @@ struct ChatView: View {
     private var messagesList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 10) {
+                // Обычный VStack, не Lazy: ленивая разметка при смене высоты клавиатуры
+                // или поля ввода промахивалась офсетом в нерассчитанную зону — чат
+                // «исчезал» с экрана. Хвост ограничен ChatCache.limit, так что жадная
+                // разметка дешёвая, а прокрутка всегда точная.
+                VStack(spacing: 12) {
                     if let loadError {
                         errorCard(loadError)
                     }
@@ -67,17 +88,45 @@ struct ChatView: View {
                             .id(msg.id)
                     }
                     Color.clear
-                        .frame(height: 6)
+                        .frame(height: 14)
                         .id(Self.tailID)
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 12)
             }
             .scrollDismissesKeyboard(.interactively)
-            .defaultScrollAnchor(.bottom)
+            .bottomAnchoredStart()
             .trackNearBottom($isNearBottom, handScrolled: $scrolledAwayByHand)
             .onChange(of: messages.last?.text) {
-                proxy.scrollTo(Self.tailID, anchor: .bottom)
+                // Растущий ответ мягко подталкивает ленту вверх (телепорт строки
+                // лечится именно анимацией). Если Слава ушёл листать старое — не трогаем.
+                guard isNearBottom || !scrolledAwayByHand else { return }
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(Self.tailID, anchor: .bottom)
+                }
+            }
+            .onChange(of: barHeight) { oldH, newH in
+                // Поле ввода подросло (перенос строки) — двигаем ленту следом,
+                // чтобы последний пузырь не уехал под поле. Уменьшение не трогаем:
+                // при сжатии поля контент и так остаётся видимым.
+                guard oldH > 0, newH > oldH, !messages.isEmpty,
+                      isNearBottom || !scrolledAwayByHand else { return }
+                barGrowScroll?.cancel()
+                barGrowScroll = Task { @MainActor in
+                    // Кадр на то, чтобы лента узнала о новой высоте поля, иначе
+                    // прокрутка целится по старым размерам и остаётся на месте.
+                    try? await Task.sleep(for: .milliseconds(30))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(Self.tailID, anchor: .bottom)
+                    }
+                    // Тихая добивка: если первый заход попал точно — пустой ход.
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeOut(duration: 0.1)) {
+                        proxy.scrollTo(Self.tailID, anchor: .bottom)
+                    }
+                }
             }
             .onChange(of: messages.count) { oldCount, _ in
                 guard !messages.isEmpty else { return }
@@ -154,21 +203,22 @@ struct ChatView: View {
                 .focused($inputFocused)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(Color.naomiBubble, in: RoundedRectangle(cornerRadius: 22))
+                .inputGlassBackground()
 
             Button(action: send) {
                 Image(systemName: "arrow.up")
                     .font(.body.weight(.bold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(canSend ? Color.primary : Color.secondary)
                     .frame(width: 38, height: 38)
-                    .background(canSend ? Color.naomiAccent : Color.naomiAccent.opacity(0.35))
+                    .background(Color.naomiBubble.opacity(canSend ? 1 : 0.55))
                     .clipShape(Circle())
             }
             .disabled(!canSend)
         }
         .padding(.horizontal, 12)
-        .padding(.top, 0)       // зазор «пузырь — поле» даёт хвост ленты (6 + spacing 10 = 16, как снизу)
+        .padding(.top, 0)       // зазор «пузырь — поле» даёт хвост ленты (14 + spacing 12 = 26)
         .padding(.bottom, 16)   // воздух между полем и клавиатурой — как в iMessage
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { barHeight = $0 }
     }
 
     private var canSend: Bool {
@@ -179,17 +229,35 @@ struct ChatView: View {
 
     private func loadHistory() async {
         do {
-            messages = try await NaomiAPI.history()
+            let fresh = Array(try await NaomiAPI.history().suffix(ChatCache.limit))
             loadError = nil
+            ChatCache.save(fresh)
+            // Живой ход не трогаем: подмена ленты посреди стрима снесла бы растущий
+            // пузырь. Слепок на диске уже свежий — на следующем старте подхватится.
+            guard !sending else { return }
+            // Сеть совпала со слепком с телефона — не дёргаем ленту (и прокрутку) зря.
+            if !sameConversation(fresh, messages) {
+                messages = fresh
+            }
         } catch {
-            loadError = "Не дозвонилась до Наоми.\nПроверь, что Мак не спит и телефон в домашнем Wi-Fi."
+            // Слепок уже на экране — молча остаёмся на нём; про сеть скажет отправка.
+            if messages.isEmpty {
+                loadError = "Не дозвонилась до Наоми.\nПроверь, что Мак не спит и телефон в домашнем Wi-Fi."
+            }
         }
+    }
+
+    private func sameConversation(_ a: [ChatMessage], _ b: [ChatMessage]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { $0.role == $1.role && $0.text == $1.text }
     }
 
     // Ход Наоми рисуется слоями, как в вебе: живая плашка «что делаю» отдельным
     // сообщением (название инструмента плавно меняется в одной строчке), затем
-    // финальный текст — своим пузырём. Плашка застывает галочкой, «думаю» без дел
-    // исчезает бесследно.
+    // финальный текст. Плашка застывает галочкой. Индикатора «печатает» нет —
+    // Слава убрал осознанно. Всё работает по id, а не по индексам. Текст выводится
+    // пейсинг-буфером: мозг отдаёт кусочки рвано (то буква, то три слова), сырой
+    // поток копится, а на экран стекает ЦЕЛЫМИ СЛОВАМИ в ровном ритме — небольшое
+    // отставание от живого стрима, зато рваность спрятана полностью.
     private func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else { return }
@@ -197,76 +265,190 @@ struct ChatView: View {
         sending = true
         messages.append(ChatMessage(role: .user, text: text))
 
-        var status = ChatMessage(role: .assistant, text: "думаю…", kind: .action)
-        status.isLive = true
-        messages.append(status)
-        var statusIndex: Int? = messages.count - 1
-        var sawAction = false      // плашка показывала настоящий инструмент, не «думаю»
-        var replyIndex: Int? = nil // текущий текстовый пузырь этого хода
+        var chipID: UUID? = nil      // активная плашка дела
+        var replyID: UUID? = nil     // растущий текстовый пузырь
+        var received = ""            // получено с сервера
+        var shown = 0                // показано на экране (в символах)
+        var streamDone = false
 
-        // Плашка отработала: с настоящим делом — застывает галочкой, пустое «думаю» — исчезает.
-        func freezeStatus() {
-            guard let i = statusIndex else { return }
-            if sawAction {
-                messages[i].isLive = false
-            } else {
-                messages.remove(at: i)
-                if let r = replyIndex, r > i { replyIndex = r - 1 }
+        // Ответ рождается сразу — пустым рядом: на месте будущей первой буквы
+        // пульсирует палочка. Перед первой буквой она схлопывается в себя, и текст
+        // появляется ровно на её месте — без отступов и сдвигов (задержку на
+        // анимацию даёт пейсинг-буфер, ответ и так идёт с небольшим запозданием).
+        var reply = ChatMessage(role: .assistant, text: "", kind: .text)
+        reply.isStreaming = true
+        messages.append(reply)
+        replyID = reply.id
+
+        func index(_ id: UUID?) -> Int? { id.flatMap { needle in messages.firstIndex { $0.id == needle } } }
+
+        // Пейсинг: показываем по слову за тик, пауза между словами мягко сжимается,
+        // когда буфер копится (отстаём — ускоряемся), и растягивается на маленьком
+        // отставании. Неполное слово в хвосте буфера не показываем — ждём его буквы.
+        let typewriter = Task { @MainActor in
+            // Прайминг: не стартуем с пары букв («две буквы и замерло») — сначала
+            // копим небольшой запас, чтобы машинка сразу пошла ровно.
+            while !streamDone && received.count < 12 && !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(30))
             }
-            statusIndex = nil
+            while !Task.isCancelled {
+                if let i = index(replyID) {
+                    let chars = Array(received)
+                    let safe = wordSafeLimit(chars, done: streamDone)
+                    if shown < safe {
+                        // Первая буква на подходе: палочка схлопывается в себя,
+                        // и только потом на её месте появляется текст.
+                        if shown == 0, !messages[i].pillarCollapsed {
+                            withAnimation(.easeIn(duration: 0.2)) { messages[i].pillarCollapsed = true }
+                            try? await Task.sleep(for: .milliseconds(230))
+                            continue   // после сна индексы могли уехать — перечитываем заново
+                        }
+                        shown = nextWordEnd(chars, from: shown, limit: safe)
+                        messages[i].text = String(chars.prefix(shown))
+                        let backlog = chars.count - shown
+                        var pause = backlog > 240 ? 26 : backlog > 120 ? 46 : backlog > 40 ? 68 : 92
+                        if streamDone { pause = min(pause, 40) }   // стрим кончился — хвост доливаем бодрее
+                        try? await Task.sleep(for: .milliseconds(pause))
+                        continue
+                    }
+                }
+                if streamDone && shown >= received.count { break }
+                try? await Task.sleep(for: .milliseconds(30))
+            }
         }
 
-        func appendReply(_ text: String, error: Bool = false) {
-            freezeStatus()
-            var reply = ChatMessage(role: .assistant, text: text)
-            reply.isStreaming = !error
-            reply.isError = error
+        func startReply() {
+            if let c = index(chipID) { messages[c].isLive = false }   // предыдущее дело → галочка
+            chipID = nil
+            received = ""; shown = 0
+            var reply = ChatMessage(role: .assistant, text: "", kind: .text)
+            reply.isStreaming = true
             messages.append(reply)
-            replyIndex = messages.count - 1
+            replyID = reply.id
         }
 
-        Task {
+        func showAction(_ name: String) {
+            if let r = index(replyID) {
+                if received.isEmpty {
+                    messages.remove(at: r)       // дело пришло раньше букв — палочку убираем без следа
+                } else {
+                    messages[r].text = received  // текст перед делом — долить целиком и застыть
+                    messages[r].isStreaming = false
+                }
+            }
+            replyID = nil
+            if let c = index(chipID) {
+                withAnimation(.easeInOut(duration: 0.2)) { messages[c].text = name }   // та же плашка перетекает
+            } else {
+                var chip = ChatMessage(role: .assistant, text: name, kind: .action)
+                chip.isLive = true
+                messages.append(chip)
+                chipID = chip.id
+            }
+        }
+
+        func fail(_ text: String) {
+            if let c = index(chipID) { messages[c].isLive = false }
+            if let r = index(replyID) {
+                if received.isEmpty { messages.remove(at: r) }
+                else { messages[r].isStreaming = false }
+            }
+            chipID = nil; replyID = nil
+            var e = ChatMessage(role: .assistant, text: text)
+            e.isError = true
+            messages.append(e)
+        }
+
+        Task { @MainActor in
             do {
                 for try await event in NaomiAPI.send(text) {
                     switch event {
                     case .delta(let piece):
-                        if replyIndex == nil { appendReply("") }
-                        if let r = replyIndex { messages[r].text += piece }
+                        if replyID == nil { startReply() }
+                        received += piece
                     case .action(let name):
-                        if let i = statusIndex {
-                            // та же строчка плавно меняет название дела
-                            sawAction = true
-                            withAnimation(.easeInOut(duration: 0.2)) { messages[i].text = name }
-                        } else {
-                            // новый слой действий после текста — новая плашка
-                            if let r = replyIndex { messages[r].isStreaming = false }
-                            replyIndex = nil
-                            var next = ChatMessage(role: .assistant, text: name, kind: .action)
-                            next.isLive = true
-                            messages.append(next)
-                            statusIndex = messages.count - 1
-                            sawAction = true
-                        }
+                        showAction(name)
                     case .silent:
                         break   // сделала молча — застывшая плашка скажет сама
                     case .failure:
-                        appendReply("Что-то пошло не так. Попробуй ещё раз.", error: true)
+                        fail("Что-то пошло не так. Попробуй ещё раз.")
                     }
                 }
-                freezeStatus()
+                streamDone = true
+                if let c = index(chipID) { messages[c].isLive = false }
             } catch {
-                appendReply("Не дозвонилась до Наоми. Проверь Wi-Fi и что Мак не спит.", error: true)
+                streamDone = true
+                fail("Не дозвонилась до Наоми. Проверь Wi-Fi и что Мак не спит.")
             }
-            if let r = replyIndex { messages[r].isStreaming = false }
+            await typewriter.value        // дать словам дотечь
+            if let r = index(replyID) {
+                if received.isEmpty {
+                    messages.remove(at: r)   // тихий ход — палочка исчезает без следа
+                } else {
+                    messages[r].text = received
+                    // Ждём, пока волна последнего слова доиграет (0.35 с), и застываем.
+                    // БЕЗ withAnimation: подмена живого вида на статичный текст даёт
+                    // одинаковую картинку, а анимация подмены «моргала» всем ответом.
+                    try? await Task.sleep(for: .milliseconds(400))
+                    if let r2 = index(replyID) { messages[r2].isStreaming = false }
+                }
+            }
             sending = false
+            ChatCache.save(messages)   // ход закончен — слепок на телефоне свежий
         }
     }
+}
+
+// ── Пейсинг стрима: границы слов ──
+
+// До какого места буфер можно показывать: неполное слово в хвосте ждёт свои буквы
+// (кусочки с сервера режут слова где попало — «по пол слова» на экране не будет).
+// Стрим закончился — можно всё.
+private func wordSafeLimit(_ chars: [Character], done: Bool) -> Int {
+    if done { return chars.count }
+    var i = chars.count - 1
+    var tail = 0
+    while i >= 0, !chars[i].isWhitespace { i -= 1; tail += 1 }
+    // «слово» тянется без пробелов неприлично долго (ссылка и т.п.) — не ждём его конца
+    return tail > 60 ? chars.count : i + 1
+}
+
+// Конец следующего слова после позиции from (вместе с пробелами перед ним).
+private func nextWordEnd(_ chars: [Character], from: Int, limit: Int) -> Int {
+    var i = from
+    while i < limit, chars[i].isWhitespace { i += 1 }
+    while i < limit, !chars[i].isWhitespace { i += 1 }
+    return max(i, min(from + 1, limit))
 }
 
 // Поле ввода как системный нижний бар (iOS 26): safeAreaBar даёт под ним родное
 // прогрессивное размытие края — ровно то же, что система рисует под шапкой.
 // На старых iOS — обычная вставка без эффекта.
 private extension View {
+    // Фон поля ввода: родное «жидкое стекло» iOS 26 — ровно тот же эффект,
+    // что у системных кнопок в шапке (шестерёнки), поле не выделяется из
+    // общего стиля. На старых iOS — прежний матовый пузырь.
+    @ViewBuilder
+    func inputGlassBackground() -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22))
+        } else {
+            self.background(Color.naomiBubble, in: RoundedRectangle(cornerRadius: 22))
+        }
+    }
+
+    // Старт ленты с низа. На iOS 18+ системный якорь ограничен ПЕРВИЧНОЙ разметкой:
+    // рост контента ведём сами анимированной прокруткой — иначе якорь дёргает ленту
+    // мгновенно, мимо анимации (тот самый телепорт строки при стриме).
+    @ViewBuilder
+    func bottomAnchoredStart() -> some View {
+        if #available(iOS 18.0, *) {
+            self.defaultScrollAnchor(.bottom, for: .initialOffset)
+        } else {
+            self.defaultScrollAnchor(.bottom)
+        }
+    }
+
     @ViewBuilder
     func floatingInputBar<Bar: View>(@ViewBuilder _ bar: @escaping () -> Bar) -> some View {
         if #available(iOS 26.0, *) {
@@ -308,10 +490,19 @@ struct MessageBubble: View {
     let message: ChatMessage
 
     var body: some View {
-        if message.kind == .action {
-            actionChip
-        } else {
-            textBubble
+        switch message.kind {
+        case .action:   actionChip
+        case .thinking: thinkingBubble
+        case .text:     textBubble
+        }
+    }
+
+    // «Думаю» — три пульсирующие точки; без пузыря, как и весь текст Наоми.
+    private var thinkingBubble: some View {
+        HStack {
+            TypingDots()
+                .padding(.vertical, 10)
+            Spacer(minLength: 48)
         }
     }
 
@@ -340,28 +531,47 @@ struct MessageBubble: View {
         }
     }
 
+    // Вид как в приложении Claude: вопрос — нейтральный пузырь справа,
+    // ответ Наоми — голый текст во всю ширину, без пузыря.
+    @ViewBuilder
     private var textBubble: some View {
-        HStack {
-            if message.role == .user { Spacer(minLength: 48) }
+        if message.role == .user {
+            HStack {
+                Spacer(minLength: 48)
+                Text(markdownText)
+                    .font(.body)
+                    .foregroundStyle(Color.primary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(Color.naomiBubble, in: RoundedRectangle(cornerRadius: 18))
+            }
+        } else {
+            // Текст от края до края: слева — где раньше была граница пузыря,
+            // справа — зеркально, без резерва под «хвост» чужих пузырей.
+            // Живой ход: пока букв нет — на месте будущей первой буквы пульсирует
+            // палочка; перед первой буквой она схлопывается в себя (pillarCollapsed
+            // взводит пейсинг), и текст рождается ровно на её месте, без отступов.
             Group {
-                if message.text.isEmpty && message.isStreaming {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.secondary)
+                if message.isStreaming && message.text.isEmpty {
+                    // Невидимая «буква» держит высоту ряда ровно как у первой строки
+                    // будущего текста (тот же шрифт, те же отступы) — при подмене
+                    // палочки на текст чат не сдвигается ни на пиксель.
+                    Text(" ")
+                        .hidden()
+                        .overlay(alignment: .leading) {
+                            PulsingPillar(collapsed: message.pillarCollapsed)
+                        }
+                } else if #available(iOS 18.0, *), message.isStreaming {
+                    FadeInText(text: message.text)   // слова проявляются волной
                 } else {
                     Text(markdownText)
-                        .font(.body)
-                        .foregroundStyle(message.role == .user ? .white : Color.primary)
-                        .opacity(message.isError ? 0.7 : 1)
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(
-                message.role == .user ? Color.naomiAccent : Color.naomiBubble,
-                in: RoundedRectangle(cornerRadius: 18)
-            )
-            if message.role == .assistant { Spacer(minLength: 48) }
+            .font(.body)
+            .foregroundStyle(Color.primary)
+            .opacity(message.isError ? 0.7 : 1)
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -371,6 +581,122 @@ struct MessageBubble: View {
             markdown: message.text,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )) ?? AttributedString(message.text)
+    }
+}
+
+// ── Проявление слов в живом стриме (iOS 18+) ──
+// Новые буквы рождаются прозрачными и мягко наливаются цветом волной —
+// как в приложении Claude. Рисуем текст сами, по глифам, через TextRenderer.
+
+@available(iOS 18.0, *)
+private struct FadeInText: View {
+    let text: String
+    // Сколько глифов уже полностью видно; анимируется — волна ползёт по новым буквам.
+    // Палочка-пульс здесь НЕ живёт (она — отдельный оверлей): текст не перерисовывается
+    // покадрово, и волна через animatableData работает без конфликтов.
+    @State private var visible: Double = 0
+
+    var body: some View {
+        Text(Self.markdown(text))
+            .textRenderer(WordFadeRenderer(visible: visible))
+            .onAppear {
+                // Вид рождается уже с первым словом (до этого на месте текста жила
+                // палочка) — проявляем это слово с нуля, той же волной.
+                visible = 0
+                withAnimation(.easeOut(duration: 0.35)) { visible = Double(text.count) }
+            }
+            .onChange(of: text) {
+                withAnimation(.easeOut(duration: 0.35)) { visible = Double(text.count) }
+            }
+    }
+
+    private static func markdown(_ s: String) -> AttributedString {
+        (try? AttributedString(
+            markdown: s,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )) ?? AttributedString(s)
+    }
+}
+
+@available(iOS 18.0, *)
+private struct WordFadeRenderer: TextRenderer {
+    var visible: Double
+    var animatableData: Double {
+        get { visible }
+        set { visible = newValue }
+    }
+
+    func draw(layout: Text.Layout, in ctx: inout GraphicsContext) {
+        var index = 0.0
+        for line in layout {
+            for run in line {
+                // Целиком видимые куски рисуем одним вызовом — дёшево.
+                if index + Double(run.count) <= visible {
+                    ctx.draw(run)
+                    index += Double(run.count)
+                    continue
+                }
+                for glyph in run {
+                    let over = index - visible
+                    if over <= 0 {
+                        ctx.draw(glyph)
+                    } else {
+                        let alpha = max(0.0, 1.0 - over / 10.0)   // хвост волны ~10 букв
+                        if alpha > 0 {
+                            var g = ctx
+                            g.opacity = alpha
+                            g.draw(glyph)
+                        }
+                    }
+                    index += 1
+                }
+            }
+        }
+    }
+}
+
+// Палочка-пульс на месте будущего ответа (аналог sp-pillar из веба): вертикальный
+// брусок дышит — сжимается до 55% и бледнеет, затем наливается. Цикл 1.4 с.
+// collapsed = true → схлопывается в себя и исчезает (перед первой буквой ответа).
+private struct PulsingPillar: View {
+    var collapsed = false
+    @State private var up = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1.5)
+            .fill(Color.naomiAccent)
+            .frame(width: 3, height: 17)
+            .scaleEffect(y: up ? 1 : 0.55)
+            .scaleEffect(collapsed ? 0.01 : 1)   // схлопывание в точку
+            .opacity(collapsed ? 0 : (up ? 1 : 0.45))
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                    up = true
+                }
+            }
+    }
+}
+
+// Три точки «Наоми думает»: бегущая волна прозрачности.
+struct TypingDots: View {
+    @State private var phase = 0
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(Color.secondary)
+                    .frame(width: 7, height: 7)
+                    .opacity(phase == i ? 1 : 0.3)
+                    .scaleEffect(phase == i ? 1 : 0.7)
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(280))
+                withAnimation(.easeInOut(duration: 0.28)) { phase = (phase + 1) % 3 }
+            }
+        }
     }
 }
 
