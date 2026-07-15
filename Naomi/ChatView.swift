@@ -10,6 +10,90 @@ struct PendingAttachment: Identifiable {
     var failed = false                           // не доехало: ⚠️ на миниатюре, убрать крестиком
 }
 
+// Коробка под отложенные прокрутки. Живёт в @State ради постоянства, но менять её
+// поля можно без перерисовки экрана (ссылка на класс не меняется) — задачам прокрутки
+// незачем инвалидировать ленту. См. комментарий у scrollTasks в ChatView.
+private final class ScrollTaskBox {
+    var keyboard: Task<Void, Never>?
+    var barGrow: Task<Void, Never>?
+    var older: Task<Void, Never>?   // возврат якоря после подгрузки старых сообщений
+    var lastKbH: CGFloat = 0         // прошлая высота клавиатуры — чтобы ловить ТОЛЬКО подъём
+}
+
+// Хвост ленты (маркер-«дно») — общий id для колонки пузырей и обработчиков прокрутки.
+private let chatTailID = "chat-tail"
+
+// Колонка пузырей вынесена в ОТДЕЛЬНЫЙ Equatable-вид: пока сами сообщения не изменились,
+// SwiftUI её пропускает (== вернёт true) и НЕ пересобирает 80 пузырей. Раньше лента жила
+// прямо в body экрана и перетряхивалась на каждый чих прокрутки (isNearBottom и т.п.) —
+// это и есть тот главный поток, что «поддёргивал» и скролл, и сворачивание клавиатуры.
+// Биндинг lightbox и замыкание onRetry в сравнении не участвуют (их и не с чем сверять),
+// но пишут в стабильное хранилище — работают даже когда вид пропущен.
+private struct BubbleColumn: View, Equatable {
+    let messages: ArraySlice<ChatMessage>
+    let loadError: String?
+    @Binding var lightbox: LightboxItem?
+    var onRetry: () -> Void
+
+    static func == (a: BubbleColumn, b: BubbleColumn) -> Bool {
+        a.loadError == b.loadError && a.messages.elementsEqual(b.messages)
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            if let loadError {
+                errorCard(loadError)
+            }
+            ForEach(messages) { msg in
+                MessageBubble(message: msg, onTapImage: { lightbox = LightboxItem(rel: $0) })
+                    // Воздух вокруг запроса Славы: зазор «запрос ↔ ответ» 12 → 16
+                    // (+30%, просьба 15.07); слои ответа между собой остаются на 12.
+                    .padding(.vertical, msg.role == .user ? 4 : 0)
+                    .id(msg.id)
+            }
+            Color.clear
+                .frame(height: 14)
+                .id(chatTailID)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+    }
+
+    private func errorCard(_ text: String) -> some View {
+        VStack(spacing: 8) {
+            Text(text)
+                .font(.subheadline)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+            Button("Попробовать ещё раз", action: onRetry)
+                .font(.subheadline.weight(.medium))
+                .tint(.naomiAccent)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+    }
+}
+
+// Кэш разметки: маркдаун (жирный/курсив) парсится один раз на строку и запоминается.
+// У готовых сообщений текст не меняется, а тело пузыря пересобирается часто (набор
+// текста в поле, прокрутка) — без кэша это лишний парсинг одного и того же на каждый
+// проход разметки. Только для застывшего текста; живой стрим рисует FadeInText сам.
+@MainActor
+private enum MarkdownCache {
+    private static var store: [String: AttributedString] = [:]
+
+    static func attributed(_ s: String) -> AttributedString {
+        if let hit = store[s] { return hit }
+        let parsed = (try? AttributedString(
+            markdown: s,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )) ?? AttributedString(s)
+        if store.count > 500 { store.removeAll(keepingCapacity: true) }   // грубая крышка от роста
+        store[s] = parsed
+        return parsed
+    }
+}
+
 struct ChatView: View {
     // Настоящий отступ чёлки от RootView: контейнер экранов растянут на весь
     // дисплей, «родные» отступы safe area внутри обнулены (см. RootView).
@@ -22,9 +106,13 @@ struct ChatView: View {
     @State private var loadError: String?
     @State private var showSettings = false
     @FocusState private var inputFocused: Bool
-    // Одна отложенная прокрутка под клавиатуру: iOS шлёт событие клавиатуры 2–3 раза
-    // подряд, и без отмены предыдущей задачи чат дёргался двумя движениями.
-    @State private var keyboardScroll: Task<Void, Never>?
+    // Отложенные прокрутки (под клавиатуру и под рост поля) держим в классе-коробке,
+    // а НЕ в @State: переустановка задачи не должна перерисовывать экран. Раньше они
+    // жили в @State — и каждое событие клавиатуры/поля дёргало пересборку всей ленты
+    // (до 300 пузырей). Ровно это и проседало, когда клавиатуру свайпом ведёшь вниз.
+    // iOS шлёт событие клавиатуры 2–3 раза подряд — прежнюю задачу отменяем, чтобы
+    // движение осталось ровно одно.
+    @State private var scrollTasks = ScrollTaskBox()
     // Пользователь у дна ленты? Если он листает старую переписку, клавиатура
     // не должна утаскивать чат вниз — вниз прокрутит только отправка сообщения.
     @State private var isNearBottom = true
@@ -35,16 +123,20 @@ struct ChatView: View {
     // Высота поля ввода: когда оно растёт (перенос строки), лента едет вверх,
     // чтобы последний пузырь не накрывало.
     @State private var barHeight: CGFloat = 0
-    // Отложенная прокрутка под рост поля — та же схема, что у клавиатуры:
-    // новая высота применяется к ленте на следующем проходе разметки, мгновенный
-    // scrollTo целился по старым размерам и не двигал чат (отставание на строку).
-    @State private var barGrowScroll: Task<Void, Never>?
+    // Прокрутка под рост поля — та же схема и та же коробка, что у клавиатуры
+    // (scrollTasks выше): новая высота применяется к ленте на следующем проходе
+    // разметки, мгновенный scrollTo целился по старым размерам и не двигал чат.
     // Вложения: выбор из фотоплёнки, очередь к отправке, открытое на весь экран фото.
     @State private var pickedItems: [PhotosPickerItem] = []
     @State private var pendingAtts: [PendingAttachment] = []
     @State private var lightbox: LightboxItem?
     // Заставка на холодном старте: прячет, как чат встаёт на место (уловка Claude).
     @State private var showSplash = true
+    // Лента рисует не всю историю разом, а последние windowCount сообщений. Остальное
+    // лежит в messages и подтягивается окном при прокрутке вверх (данные уже в памяти —
+    // подгрузка мгновенная, без похода в сеть). 300 живых пузырей разом — вот что
+    // проседало: на экране нужны 1–2 экрана переписки, а не вся история сразу.
+    @State private var windowCount = ChatView.windowBase
 
     var body: some View {
         ZStack {
@@ -113,42 +205,41 @@ struct ChatView: View {
     // Хвост ленты: прокрутка кодом целится в него, а пружина клампит контент по нему же —
     // поэтому «дно» всегда одно и то же, и последний пузырь не заезжает в зону затемнения
     // у поля ввода. Зазор «пузырь — поле» = высота хвоста + spacing стека.
-    private static let tailID = "chat-tail"
+    // Показываем сразу windowBase последних сообщений; выше — по windowStep за подгрузку.
+    // База небольшая (60): колонка НЕ ленивая (Lazy промахивался офсетом при смене высоты
+    // клавиатуры — чат «исчезал»), поэтому все пузыри окна пересчитывают разметку, когда
+    // клавиатуру ведёшь пальцем вниз. Меньше окно — легче этот покадровый пересчёт. Шаг
+    // подгрузки крупный (80): первый же долист вверх поднимает окно до 140, так что
+    // подгрузка (единственный момент, где лента может дёрнуть) при листании истории редка.
+    private static let windowBase = 60
+    private static let windowStep = 80
+
+    // Последние windowCount сообщений — то, что реально рисуется. suffix сам берёт
+    // всё, если история короче окна. Живой ответ всегда последний, значит всегда в окне.
+    private var windowed: ArraySlice<ChatMessage> { messages.suffix(windowCount) }
 
     private var messagesList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                // Обычный VStack, не Lazy: ленивая разметка при смене высоты клавиатуры
-                // или поля ввода промахивалась офсетом в нерассчитанную зону — чат
-                // «исчезал» с экрана. Хвост ограничен ChatCache.limit, так что жадная
-                // разметка дешёвая, а прокрутка всегда точная.
-                VStack(spacing: 12) {
-                    if let loadError {
-                        errorCard(loadError)
-                    }
-                    ForEach(messages) { msg in
-                        MessageBubble(message: msg, onTapImage: { lightbox = LightboxItem(rel: $0) })
-                            // Воздух вокруг запроса Славы: зазор «запрос ↔ ответ» 12 → 16
-                            // (+30%, просьба 15.07); слои ответа между собой остаются на 12.
-                            .padding(.vertical, msg.role == .user ? 4 : 0)
-                            .id(msg.id)
-                    }
-                    Color.clear
-                        .frame(height: 14)
-                        .id(Self.tailID)
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 12)
+                // Обычный VStack (внутри BubbleColumn), не Lazy: ленивая разметка при смене
+                // высоты клавиатуры/поля промахивалась офсетом в нерассчитанную зону — чат
+                // «исчезал». Рисуется только окно windowed (старое приезжает прокруткой
+                // вверх), а сама колонка — Equatable-вид: прокрутка её НЕ пересобирает.
+                BubbleColumn(messages: windowed, loadError: loadError, lightbox: $lightbox,
+                             onRetry: { Task { await loadHistory() } })
+                    .equatable()
             }
             .scrollDismissesKeyboard(.interactively)
             .bottomAnchoredStart()
             .trackNearBottom($isNearBottom, handScrolled: $scrolledAwayByHand)
+            // Подтягиваем старые сообщения, когда прокрутка почти у верха окна.
+            .trackNearTop { growOlder(proxy) }
             .onChange(of: messages.last?.text) {
                 // Растущий ответ мягко подталкивает ленту вверх (телепорт строки
                 // лечится именно анимацией). Если Слава ушёл листать старое — не трогаем.
                 guard isNearBottom || !scrolledAwayByHand else { return }
                 withAnimation(.easeOut(duration: 0.2)) {
-                    proxy.scrollTo(Self.tailID, anchor: .bottom)
+                    proxy.scrollTo(chatTailID, anchor: .bottom)
                 }
             }
             .onChange(of: barHeight) { oldH, newH in
@@ -157,20 +248,20 @@ struct ChatView: View {
                 // при сжатии поля контент и так остаётся видимым.
                 guard oldH > 0, newH > oldH, !messages.isEmpty,
                       isNearBottom || !scrolledAwayByHand else { return }
-                barGrowScroll?.cancel()
-                barGrowScroll = Task { @MainActor in
+                scrollTasks.barGrow?.cancel()
+                scrollTasks.barGrow = Task { @MainActor in
                     // Кадр на то, чтобы лента узнала о новой высоте поля, иначе
                     // прокрутка целится по старым размерам и остаётся на месте.
                     try? await Task.sleep(for: .milliseconds(30))
                     guard !Task.isCancelled else { return }
                     withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(Self.tailID, anchor: .bottom)
+                        proxy.scrollTo(chatTailID, anchor: .bottom)
                     }
                     // Тихая добивка: если первый заход попал точно — пустой ход.
                     try? await Task.sleep(for: .milliseconds(200))
                     guard !Task.isCancelled else { return }
                     withAnimation(.easeOut(duration: 0.1)) {
-                        proxy.scrollTo(Self.tailID, anchor: .bottom)
+                        proxy.scrollTo(chatTailID, anchor: .bottom)
                     }
                 }
             }
@@ -180,16 +271,16 @@ struct ChatView: View {
                     // Первичная загрузка истории: встаём на дно мгновенно, без «киносеанса»
                     // с прокруткой всей переписки. Тихая добивка — после ленивой разметки,
                     // чтобы дно было точным и клавиатурный подъезд не блокировался.
-                    proxy.scrollTo(Self.tailID, anchor: .bottom)
+                    proxy.scrollTo(chatTailID, anchor: .bottom)
                     Task { @MainActor in
                         try? await Task.sleep(for: .milliseconds(350))
-                        proxy.scrollTo(Self.tailID, anchor: .bottom)
+                        proxy.scrollTo(chatTailID, anchor: .bottom)
                     }
                 } else {
                     // Отправка или новый ответ — единственный момент, когда чат едет вниз
                     // из любой глубины переписки.
                     withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo(Self.tailID, anchor: .bottom)
+                        proxy.scrollTo(chatTailID, anchor: .bottom)
                     }
                 }
             }
@@ -201,43 +292,55 @@ struct ChatView: View {
                 // он хочет видеть найденное место, а не дно чата.
                 let kbH = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect)
                     .map { UIScreen.main.bounds.height - $0.origin.y } ?? -1
+                // Реагируем ТОЛЬКО на подъём клавиатуры. На сворачивании пальцем клавиатура
+                // едет вниз вместе с рукой — гнать в этот момент ленту к дну значило бы
+                // драться с пальцем (то самое «поддёргивание при сворачивании»). Прошлую
+                // высоту помним в коробке (не в @State — незачем перерисовывать ленту).
+                let prevKbH = scrollTasks.lastKbH
+                scrollTasks.lastKbH = max(kbH, 0)
                 guard isNearBottom || !scrolledAwayByHand, kbH > 0, !messages.isEmpty else { return }
-                keyboardScroll?.cancel()
-                keyboardScroll = Task { @MainActor in
+                guard kbH >= prevKbH else { return }   // вниз (сворачивание) — не вмешиваемся
+                scrollTasks.keyboard?.cancel()
+                scrollTasks.keyboard = Task { @MainActor in
                     // Первый скролл — почти сразу, чтобы ехать ПАРАЛЛЕЛЬНО с клавиатурой
                     // (одно движение на глаз). Даже после холодного старта, когда система
                     // не считает ленту «докрученной» и сама её не везёт.
                     try? await Task.sleep(for: .milliseconds(60))
                     guard !Task.isCancelled else { return }
                     withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo(Self.tailID, anchor: .bottom)
+                        proxy.scrollTo(chatTailID, anchor: .bottom)
                     }
                     // Тихая добивка после всех анимаций: если первый скролл попал точно —
                     // это пустой ход, если промахнулся на пиксели — мягко доводит.
                     try? await Task.sleep(for: .milliseconds(350))
                     guard !Task.isCancelled else { return }
                     withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(Self.tailID, anchor: .bottom)
+                        proxy.scrollTo(chatTailID, anchor: .bottom)
                     }
                 }
             }
         }
     }
 
-    private func errorCard(_ text: String) -> some View {
-        VStack(spacing: 8) {
-            Text(text)
-                .font(.subheadline)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-            Button("Попробовать ещё раз") {
-                Task { await loadHistory() }
-            }
-            .font(.subheadline.weight(.medium))
-            .tint(.naomiAccent)
+    // Прокрутка почти у верха окна — показываем следующую порцию старых сообщений.
+    // Данные уже в memory (messages), так что подгрузка мгновенная. Чтобы добавленные
+    // сверху ряды не столкнули ленту вниз, тут же возвращаем якорь — самое старое из
+    // ранее показанных — на верх экрана: смотришь ту же переписку, старое лежит выше,
+    // готовое к дальнейшей прокрутке. scrolledAwayByHand в условии отсекает ложный
+    // «верх» на первом кадре холодного старта (пока Слава не листнул рукой).
+    private func growOlder(_ proxy: ScrollViewProxy) {
+        guard windowCount < messages.count, scrolledAwayByHand else { return }
+        let anchorID = windowed.first?.id
+        windowCount = min(windowCount + Self.windowStep, messages.count)
+        guard let anchorID else { return }
+        scrollTasks.older?.cancel()
+        scrollTasks.older = Task { @MainActor in
+            // Кадр на то, чтобы новые ряды встали в разметку, иначе якорь целится
+            // по старым позициям. Без анимации — подмена происходит незаметно.
+            try? await Task.sleep(for: .milliseconds(16))
+            guard !Task.isCancelled else { return }
+            proxy.scrollTo(anchorID, anchor: .top)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 24)
     }
 
     // ── Поле ввода ──
@@ -687,6 +790,24 @@ private extension View {
             self
         }
     }
+
+    // Прокрутка почти у верха окна — сигналим наверх, что пора показать порцию старых
+    // сообщений. Порог маленький (60 пт): данные уже в памяти, подгрузка мгновенная,
+    // поэтому большой запас не нужен, а маленький — меньше сдвигает ленту при возврате
+    // якоря. onScrollGeometryChange зовёт action только на СМЕНЕ значения, так что на
+    // первом кадре (лента у дна) ложно не срабатывает. Старые iOS — без подгрузки.
+    @ViewBuilder
+    func trackNearTop(_ onReach: @escaping () -> Void) -> some View {
+        if #available(iOS 18.0, *) {
+            self.onScrollGeometryChange(for: Bool.self) { geo in
+                geo.contentOffset.y < 60
+            } action: { _, isNear in
+                if isNear { onReach() }
+            }
+        } else {
+            self
+        }
+    }
 }
 
 // ── Пузырь сообщения ──
@@ -782,12 +903,11 @@ struct MessageBubble: View {
         }
     }
 
-    // Лёгкий маркдаун (жирный, курсив), с сохранением переносов строк.
+    // Лёгкий маркдаун (жирный, курсив), с сохранением переносов строк. Парсинг
+    // кэшируется (MarkdownCache): у готовых сообщений текст стабильный, а пузырь
+    // пересобирается часто — незачем парсить одно и то же заново на каждый проход.
     private var markdownText: AttributedString {
-        (try? AttributedString(
-            markdown: message.text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        )) ?? AttributedString(message.text)
+        MarkdownCache.attributed(message.text)
     }
 }
 

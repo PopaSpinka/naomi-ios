@@ -114,9 +114,20 @@ struct OrdersView: View {
         // Открытая вкладка поллит как веб (5 сек), спрятанная — раз в минуту:
         // к переключению всё готово. Смена active перезапускает задачу.
         .task(id: active) {
+            // Спрятанная вкладка прогревается ОДИН раз и затихает — фоновый опрос раз в
+            // минуту пересобирал вьюху на главном потоке и спотыкал жест клавиатуры в чате
+            // (подробно — в HomeView). Живой опрос только у открытой; прогрев — если карточек
+            // ещё нет (orders == nil), чтобы уход с вкладки не тянул лишний запрос.
+            guard active else {
+                if orders == nil {
+                    try? await Task.sleep(for: .milliseconds(700))
+                    await load()
+                }
+                return
+            }
             while !Task.isCancelled {
                 await load()
-                try? await Task.sleep(for: .seconds(active ? 5 : 60))
+                try? await Task.sleep(for: .seconds(5))
             }
         }
         .alert("Очистить корзину насовсем?", isPresented: $confirmPurge) {

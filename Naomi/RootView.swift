@@ -64,7 +64,18 @@ struct RootView: View {
                     // Скругление и тень живут только у отъехавшего экрана:
                     // прижатый — обычный, во весь экран и без рамок.
                     .clipShape(RoundedRectangle(cornerRadius: menuOpen ? 34 : 0, style: .continuous))
-                    .shadow(color: .black.opacity(menuOpen ? 0.22 : 0), radius: 30, x: -10)
+                    // Тень — на ПОДЛОЖКЕ позади карточки, а не на самих экранах.
+                    // .shadow поверх screens заставлял каждый кадр анимации шторки
+                    // растеризовать все восемь экранов (стекло, текст) в скрытый буфер
+                    // и размывать его целиком — отсюда просадка FPS при открытии шторки.
+                    // Тень от простого залитого прямоугольника (та же форма и скругление)
+                    // считается дёшево, а на глаз карточка выглядит ровно как раньше.
+                    // Подложка — вплотную под клипнутой картой, из-под неё торчит только тень.
+                    .background {
+                        RoundedRectangle(cornerRadius: menuOpen ? 34 : 0, style: .continuous)
+                            .fill(Color.naomiBg)
+                            .shadow(color: .black.opacity(menuOpen ? 0.22 : 0), radius: 30, x: -10)
+                    }
                     // Кнопка шторки — НЕ в тулбаре, а своя, парит поверх карточки.
                     // Системную кнопку в шапке при нажатии раздувало стеклом вверх
                     // и резало о потолок шапки (границу safe area) — свободную кнопку
@@ -147,22 +158,36 @@ struct RootView: View {
     // Кнопку шторки экраны не носят — она одна, парит поверх в RootView.
     private var screens: some View {
         ZStack {
+            // Чат ВСЕГДА в стопке — его состояние (черновик, живой стрим, прокрутка)
+            // переживает походы по вкладкам, и именно на нём живёт клавиатура.
             ChatView()
                 .sectionVisible(section == .chat)
-            HomeView(active: section == .home)
-                .sectionVisible(section == .home)
-            TimelineView(active: section == .timeline)
-                .sectionVisible(section == .timeline)
-            OrdersView(scope: .ideas, trashOpen: $ideasTrashOpen, active: section == .ideas)
-                .sectionVisible(section == .ideas)
-            OrdersView(scope: .notes, active: section == .notes)
-                .sectionVisible(section == .notes)
-            OrdersView(scope: .reminds, active: section == .reminders)
-                .sectionVisible(section == .reminders)
-            OrdersView(scope: .auto, active: section == .auto)
-                .sectionVisible(section == .auto)
-            FilesView(active: section == .files)
-                .sectionVisible(section == .files)
+            // Прочие вкладки рисуем ТОЛЬКО когда открыты. Раньше все 8 экранов висели
+            // в стопке всегда — и раскладка проходила по всем восьми на КАЖДЫЙ кадр
+            // движения клавиатуры в чате: пустые (без сети) проходились мгновенно, а
+            // набитые данными с сервера — по 8 глубоких деревьев за кадр, оттого 10 fps
+            // при сворачивании (подтверждено замером: с одним чатом в стопке жест идеально
+            // гладкий). Теперь рядом с чатом висит максимум один экран — открытый. Плата:
+            // вкладка грузится при открытии (сеть локальная — доли секунды), а не заранее;
+            // состояние чата это не трогает.
+            switch section {
+            case .chat:
+                EmptyView()
+            case .home:
+                HomeView(active: true)
+            case .timeline:
+                TimelineView(active: true)
+            case .ideas:
+                OrdersView(scope: .ideas, trashOpen: $ideasTrashOpen, active: true)
+            case .notes:
+                OrdersView(scope: .notes, active: true)
+            case .reminders:
+                OrdersView(scope: .reminds, active: true)
+            case .auto:
+                OrdersView(scope: .auto, active: true)
+            case .files:
+                FilesView(active: true)
+            }
         }
     }
 
@@ -261,6 +286,16 @@ private extension View {
         self.opacity(on ? 1 : 0)
             .allowsHitTesting(on)
             .accessibilityHidden(!on)
+            // Спрятанные экраны НЕ отодвигаются от клавиатуры. Контейнер RootView
+            // гасит только .container-зону (клавиатурную оставляет живой), поэтому
+            // иначе клавиатурный отступ приходит ВСЕМ восьми экранам разом — и каждый
+            // кадр движения клавиатуры (сворачивание пальцем, скрытие при открытии
+            // шторки) все восемь пересчитывают разметку, хотя виден один. Это и есть
+            // главный тормоз при сворачивании. Целим edges динамически, а НЕ через
+            // if/else: тип вида не меняется — ChatView не пересоздаётся, стрим и
+            // черновик переживают переключение вкладок. Пустой набор = обычное
+            // поведение (видимый экран отъезжает от клавиатуры как раньше).
+            .ignoresSafeArea(.keyboard, edges: on ? [] : .all)
     }
 
     // Родное «жидкое стекло» iOS 26, как у кнопок шапки; фолбэк — матовый круг.

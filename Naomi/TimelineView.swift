@@ -46,6 +46,12 @@ struct TimelineView: View {
     @State private var events: [NaomiAPI.TimelineEvent] = []
     @State private var loaded = false   // первый ответ пришёл (пустая лента ≠ «грузим»)
     @State private var failed = false   // ошибка ≠ «пока пусто»: не врём про пустую ленту
+    // Рисуем не всю ленту разом, а первые shownCount событий (самые свежие сверху);
+    // старое приезжает порциями при прокрутке вниз. События уже в памяти — подгрузка
+    // мгновенная. Так и разметка дешевле, и группировка по дням считается по окну.
+    @State private var shownCount = TimelineView.windowBase
+    private static let windowBase = 80    // сколько свежих событий показываем сразу
+    private static let windowStep = 80    // сколько добавляем за одну подгрузку вниз
 
     var body: some View {
         NavigationStack {
@@ -59,9 +65,20 @@ struct TimelineView: View {
         // Открытая вкладка поллит как веб (4 сек), спрятанная — раз в минуту:
         // к переключению лента уже наполнена. Смена active перезапускает задачу.
         .task(id: active) {
+            // Спрятанная вкладка прогревается ОДИН раз и затихает — фоновый опрос раз в
+            // минуту пересобирал вьюху на главном потоке и спотыкал жест клавиатуры в чате
+            // (подробно — в HomeView). Живой опрос только у открытой; прогрев — если данных
+            // ещё нет, чтобы уход с вкладки не тянул лишний запрос.
+            guard active else {
+                if !loaded {
+                    try? await Task.sleep(for: .milliseconds(700))
+                    await load()
+                }
+                return
+            }
             while !Task.isCancelled {
                 await load()
-                try? await Task.sleep(for: .seconds(active ? 4 : 60))
+                try? await Task.sleep(for: .seconds(4))
             }
         }
     }
@@ -97,11 +114,22 @@ struct TimelineView: View {
                             dayHeader(day.label)
                         }
                     }
+                    // Порог подгрузки: как только этот ряд доезжает до низа (LazyVStack
+                    // рождает его только тогда), показываем следующую порцию старого.
+                    // Старое приходит СНИЗУ — лента не прыгает, доскролл не нужен.
+                    if shownCount < events.count {
+                        ProgressView()
+                            .tint(tlMuted)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .onAppear { shownCount = min(shownCount + Self.windowStep, events.count) }
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 24)
             }
-            .refreshable { await load() }
+            // Потянул обновить — снова показываем только свежую верхушку.
+            .refreshable { shownCount = Self.windowBase; await load() }
         }
     }
 
@@ -195,7 +223,7 @@ struct TimelineView: View {
         let cal = Calendar.current
         var out: [TLDay] = []
         var curKey = ""
-        for ev in events {
+        for ev in events.prefix(shownCount) {
             let date = Date(timeIntervalSince1970: TimeInterval(ev.ts))
             let c = cal.dateComponents([.year, .month, .day], from: date)
             let key = "\(c.year ?? 0)-\(c.month ?? 0)-\(c.day ?? 0)"

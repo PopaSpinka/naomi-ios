@@ -193,7 +193,17 @@ enum NaomiAPI {
 
     private struct OrdersResponse: Decodable { let orders: [Order] }
 
+    // Четыре вкладки Поручений (идеи/заметки/напоминалки/автоматика) тянут ОДИН и тот
+    // же список — каждая фильтрует по своему виду уже у себя. На холодном старте и на
+    // общем 60-секундном тике это било 8 одинаковых запросов разом. Склейка вызовов,
+    // летящих в один момент (OrdersInflight), сводит их к одному походу в сеть. Кэша
+    // по времени тут НЕТ намеренно: после действия над карточкой список должен
+    // перечитаться сразу, без застоя.
     static func orders(status: String) async throws -> [Order] {
+        try await OrdersInflight.shared.get(status: status)
+    }
+
+    fileprivate static func fetchOrders(status: String) async throws -> [Order] {
         var comps = URLComponents(url: base.appendingPathComponent("api/orders"), resolvingAgainstBaseURL: false)!
         comps.queryItems = [URLQueryItem(name: "status", value: status)]
         var req = URLRequest(url: comps.url!)
@@ -451,5 +461,24 @@ enum NaomiAPI {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+}
+
+// Склейка одновременных запросов Поручений: если несколько вкладок просят один и тот
+// же список в один момент, все ждут ОДНОГО похода в сеть. Держится только «в полёте» —
+// как только запрос завершился, следующий вызов идёт свежим (никакого устаревания
+// после действий над карточками). На главном потоке живёт лишь дешёвая бухгалтерия
+// словаря; сам запрос и разбор JSON идут в стороне (fetchOrders — не на MainActor).
+@MainActor
+private final class OrdersInflight {
+    static let shared = OrdersInflight()
+    private var tasks: [String: Task<[NaomiAPI.Order], Error>] = [:]
+
+    func get(status: String) async throws -> [NaomiAPI.Order] {
+        if let running = tasks[status] { return try await running.value }
+        let task = Task { try await NaomiAPI.fetchOrders(status: status) }
+        tasks[status] = task
+        defer { tasks[status] = nil }
+        return try await task.value
     }
 }
