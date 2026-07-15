@@ -6,7 +6,7 @@ import SwiftUI
 struct NaomiApp: App {
     var body: some Scene {
         WindowGroup {
-            ChatView()
+            RootView()
         }
     }
 }

@@ -15,6 +15,7 @@ enum ChatCache {
         let role: String
         let text: String
         let files: [String]?
+        let kind: String?    // "action" — застывшая плашка дела; nil — обычный текст
     }
 
     static func load() -> [ChatMessage] {
@@ -22,21 +23,26 @@ enum ChatCache {
               let stored = try? JSONDecoder().decode([StoredMessage].self, from: data)
         else { return [] }
         return stored.map {
-            var m = ChatMessage(role: $0.role == "user" ? .user : .assistant, text: $0.text)
+            var m = ChatMessage(role: $0.role == "user" ? .user : .assistant,
+                                text: $0.text,
+                                kind: $0.kind == "action" ? .action : .text)
             m.files = $0.files ?? []
             return m
         }
     }
 
     static func save(_ messages: [ChatMessage]) {
-        // Только переписка (текст и фото): плашки дел и ошибки — живое, в слепок не идут.
+        // Переписка и застывшие плашки дел (слои хода — как segments в серверной истории):
+        // после перезапуска лента выглядит ровно как перед ним. Ошибки и «думаю» — живое,
+        // в слепок не идут.
         let stored = messages
-            .filter { $0.kind == .text && !$0.isError && (!$0.text.isEmpty || !$0.files.isEmpty) }
+            .filter { ($0.kind == .text || $0.kind == .action) && !$0.isError && (!$0.text.isEmpty || !$0.files.isEmpty) }
             .suffix(limit)
             .map { StoredMessage(
                 role: $0.role == .user ? "user" : "assistant",
                 text: $0.text,
-                files: $0.files.isEmpty ? nil : $0.files
+                files: $0.files.isEmpty ? nil : $0.files,
+                kind: $0.kind == .action ? "action" : nil
             ) }
         guard let data = try? JSONEncoder().encode(Array(stored)) else { return }
         try? data.write(to: fileURL, options: .atomic)

@@ -11,6 +11,9 @@ struct PendingAttachment: Identifiable {
 }
 
 struct ChatView: View {
+    // Настоящий отступ чёлки от RootView: контейнер экранов растянут на весь
+    // дисплей, «родные» отступы safe area внутри обнулены (см. RootView).
+    @Environment(\.naomiTopInset) private var topInset
     // Холодный старт — сразу со слепком с телефона: чат виден мгновенно,
     // сеть догоняет в фоне (loadHistory) и тихо обновляет, если что-то изменилось.
     @State private var messages: [ChatMessage] = ChatCache.load()
@@ -58,20 +61,21 @@ struct ChatView: View {
                 .floatingInputBar { inputBar }
                 .navigationTitle("Наоми")
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { showSettings = true } label: {
-                            Image(systemName: "gearshape")
-                        }
-                        .tint(.primary)
-                    }
-                }
                 .sheet(isPresented: $showSettings) {
                     SettingsSheet { Task { await loadHistory() } }
                 }
                 .fullScreenCover(item: $lightbox) { item in
                     LightboxView(rel: item.rel)
                 }
+            }
+            // Шестерёнка — парит поверх шапки, не в тулбаре: системную кнопку
+            // при нажатии раздувало стеклом и резало о потолок шапки (та же
+            // болячка, что была у кнопки шторки — см. RootView). Отступ чёлки —
+            // вручную из naomiTopInset, вровень с кнопкой шторки слева.
+            .overlay(alignment: .topTrailing) {
+                GlassCircleButton(systemName: "gearshape") { showSettings = true }
+                    .padding(.trailing, 18)
+                    .padding(.top, topInset + 4)
             }
 
             // Заставка холодного старта (уловка Claude): пока под ней чат встаёт на
@@ -124,6 +128,9 @@ struct ChatView: View {
                     }
                     ForEach(messages) { msg in
                         MessageBubble(message: msg, onTapImage: { lightbox = LightboxItem(rel: $0) })
+                            // Воздух вокруг запроса Славы: зазор «запрос ↔ ответ» 12 → 16
+                            // (+30%, просьба 15.07); слои ответа между собой остаются на 12.
+                            .padding(.vertical, msg.role == .user ? 4 : 0)
                             .id(msg.id)
                     }
                     Color.clear
@@ -403,14 +410,17 @@ struct ChatView: View {
 
     private func sameConversation(_ a: [ChatMessage], _ b: [ChatMessage]) -> Bool {
         a.count == b.count && zip(a, b).allSatisfy {
-            $0.role == $1.role && $0.text == $1.text && $0.files == $1.files
+            $0.role == $1.role && $0.kind == $1.kind && $0.text == $1.text && $0.files == $1.files
         }
     }
 
     // Ход Наоми рисуется слоями, как в вебе: живая плашка «что делаю» отдельным
     // сообщением (название инструмента плавно меняется в одной строчке), затем
-    // финальный текст. Плашка застывает галочкой. Индикатора «печатает» нет —
-    // Слава убрал осознанно. Всё работает по id, а не по индексам. Текст выводится
+    // финальный текст. Кадр break режет текст на отдельные пузыри-слои (мозг начал
+    // новый блок после дела или фоновой паузы) — куски не клеятся в один.
+    // Плашка застывает галочкой. Ни индикатора «печатает», ни заготовки под ответ —
+    // Слава убрал осознанно: ряды рождаются лениво, под реально пришедший контент.
+    // Всё работает по id, а не по индексам. Текст выводится
     // пейсинг-буфером: мозг отдаёт кусочки рвано (то буква, то три слова), сырой
     // поток копится, а на экран стекает ЦЕЛЫМИ СЛОВАМИ в ровном ритме — небольшое
     // отставание от живого стрима, зато рваность спрятана полностью.
@@ -431,14 +441,12 @@ struct ChatView: View {
         var shown = 0                // показано на экране (в символах)
         var streamDone = false
 
-        // Ответ рождается сразу — пустым рядом: на месте будущей первой буквы
-        // пульсирует палочка. Перед первой буквой она схлопывается в себя, и текст
-        // появляется ровно на её месте — без отступов и сдвигов (задержку на
-        // анимацию даёт пейсинг-буфер, ответ и так идёт с небольшим запозданием).
-        var reply = ChatMessage(role: .assistant, text: "", kind: .text)
-        reply.isStreaming = true
-        messages.append(reply)
-        replyID = reply.id
+        // Место под ответ НЕ резервируем (15.07, Слава: «не готовь место заранее»):
+        // отправленное сообщение просто встаёт последним, лента подъезжает к нему — и всё.
+        // Ряд ответа рождается ЛЕНИВО, ровно когда виден контент: печатная машинка создаёт
+        // его в момент показа ПЕРВОГО СЛОВА (не на первой дельте — иначе пустой ряд успел бы
+        // сдвинуть ленту до текста), а тул — своей плашкой сразу с подписью. Так сдвиг ленты
+        // всегда совпадает с появлением текста/плашки, без пустого мига между ними.
 
         func index(_ id: UUID?) -> Int? { id.flatMap { needle in messages.firstIndex { $0.id == needle } } }
 
@@ -446,72 +454,81 @@ struct ChatView: View {
         // когда буфер копится (отстаём — ускоряемся), и растягивается на маленьком
         // отставании. Неполное слово в хвосте буфера не показываем — ждём его буквы.
         let typewriter = Task { @MainActor in
-            // Прайминг: не стартуем с пары букв («две буквы и замерло») — сначала
-            // копим небольшой запас, чтобы машинка сразу пошла ровно.
+            // Прайминг (однократно, в начале хода): не стартуем с пары букв («две буквы и
+            // замерло») — сначала копим небольшой запас. Ждём НЕВИДИМО: ряд ответа ещё не
+            // создан, лента не дёргается пустой заготовкой.
             while !streamDone && received.count < 12 && !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(30))
             }
             while !Task.isCancelled {
-                if let i = index(replyID) {
-                    let chars = Array(received)
-                    let safe = wordSafeLimit(chars, done: streamDone)
-                    if shown < safe {
-                        // Первая буква на подходе: палочка схлопывается в себя,
-                        // и только потом на её месте появляется текст.
-                        if shown == 0, !messages[i].pillarCollapsed {
-                            withAnimation(.easeIn(duration: 0.2)) { messages[i].pillarCollapsed = true }
-                            try? await Task.sleep(for: .milliseconds(230))
-                            continue   // после сна индексы могли уехать — перечитываем заново
-                        }
-                        shown = nextWordEnd(chars, from: shown, limit: safe)
+                let chars = Array(received)
+                let safe = wordSafeLimit(chars, done: streamDone)
+                if shown < safe {
+                    shown = nextWordEnd(chars, from: shown, limit: safe)
+                    if let i = index(replyID) {
                         messages[i].text = String(chars.prefix(shown))
-                        let backlog = chars.count - shown
-                        var pause = backlog > 240 ? 26 : backlog > 120 ? 46 : backlog > 40 ? 68 : 92
-                        if streamDone { pause = min(pause, 40) }   // стрим кончился — хвост доливаем бодрее
-                        try? await Task.sleep(for: .milliseconds(pause))
-                        continue
+                    } else {
+                        // Ряд текущего текст-блока ещё не рождён — создаём ЕГО СЕЙЧАС, уже с
+                        // первым словом: сдвиг ленты и появление текста совпадают (ровно как
+                        // у плашки тула), без пустого мига между ними.
+                        if let c = index(chipID) { messages[c].isLive = false }   // дело → галочка
+                        chipID = nil
+                        var reply = ChatMessage(role: .assistant, text: String(chars.prefix(shown)), kind: .text)
+                        reply.isStreaming = true
+                        messages.append(reply)
+                        replyID = reply.id
                     }
+                    let backlog = chars.count - shown
+                    var pause = backlog > 240 ? 26 : backlog > 120 ? 46 : backlog > 40 ? 68 : 92
+                    if streamDone { pause = min(pause, 40) }   // стрим кончился — хвост доливаем бодрее
+                    try? await Task.sleep(for: .milliseconds(pause))
+                    continue
                 }
                 if streamDone && shown >= received.count { break }
                 try? await Task.sleep(for: .milliseconds(30))
             }
         }
 
-        func startReply() {
-            if let c = index(chipID) { messages[c].isLive = false }   // предыдущее дело → галочка
-            chipID = nil
-            received = ""; shown = 0
-            var reply = ChatMessage(role: .assistant, text: "", kind: .text)
-            reply.isStreaming = true
-            messages.append(reply)
-            replyID = reply.id
-        }
-
-        // Файл от Наоми: миниатюра в текущий ответ, а без него — отдельным рядом.
-        func showFile(_ rel: String) {
-            if let r = index(replyID) {
-                messages[r].files.append(rel)
-            } else {
-                var m = ChatMessage(role: .assistant, text: "")
-                m.files = [rel]
-                messages.append(m)
-            }
-        }
-
-        func showAction(_ name: String) {
+        // Текст-слой закончился (кадр break, дело или файл после текста): пузырь застывает,
+        // недопоказанный пейсингом хвост доливаем целиком; пустой ряд (букв не пришло)
+        // убираем без следа. Буфер пейсинга — заново под следующий слой: иначе машинка
+        // ждала бы «недопоказанные» буквы уже закрытого пузыря и ход не завершался.
+        func closeReply() {
             if let r = index(replyID) {
                 if received.isEmpty && messages[r].files.isEmpty {
-                    messages.remove(at: r)       // дело пришло раньше букв — палочку убираем без следа
+                    messages.remove(at: r)
                 } else {
-                    messages[r].text = received  // текст перед делом — долить целиком и застыть
+                    messages[r].text = received
                     messages[r].isStreaming = false
                 }
+            } else if !received.isEmpty {
+                // Блок закрылся, пока машинка ещё праймила (видимый ряд не успел родиться),
+                // но текст пришёл — кладём его сразу застывшим, чтобы короткий блок не потерялся.
+                if let c = index(chipID) { messages[c].isLive = false }
+                chipID = nil
+                messages.append(ChatMessage(role: .assistant, text: received))
             }
             replyID = nil
+            received = ""; shown = 0
+        }
+
+        // Файл от Наоми — своим слоем на своём месте потока (как в вебе): текст до него
+        // застывает, живая плашка дела — галочкой, следующий текст откроет новый пузырь.
+        func showFile(_ rel: String) {
+            closeReply()
+            if let c = index(chipID) { messages[c].isLive = false }
+            chipID = nil
+            var m = ChatMessage(role: .assistant, text: "")
+            m.files = [rel]
+            messages.append(m)
+        }
+
+        func showAction(_ label: String) {
+            closeReply()
             if let c = index(chipID) {
-                withAnimation(.easeInOut(duration: 0.2)) { messages[c].text = name }   // та же плашка перетекает
+                withAnimation(.easeInOut(duration: 0.2)) { messages[c].text = label }   // та же плашка перетекает
             } else {
-                var chip = ChatMessage(role: .assistant, text: name, kind: .action)
+                var chip = ChatMessage(role: .assistant, text: label, kind: .action)
                 chip.isLive = true
                 messages.append(chip)
                 chipID = chip.id
@@ -520,11 +537,8 @@ struct ChatView: View {
 
         func fail(_ text: String) {
             if let c = index(chipID) { messages[c].isLive = false }
-            if let r = index(replyID) {
-                if received.isEmpty && messages[r].files.isEmpty { messages.remove(at: r) }
-                else { messages[r].isStreaming = false }
-            }
-            chipID = nil; replyID = nil
+            chipID = nil
+            closeReply()   // что успело прийти — остаётся на экране целиком
             var e = ChatMessage(role: .assistant, text: text)
             e.isError = true
             messages.append(e)
@@ -535,10 +549,15 @@ struct ChatView: View {
                 for try await event in NaomiAPI.send(text, attachments: atts) {
                     switch event {
                     case .delta(let piece):
-                        if replyID == nil { startReply() }
-                        received += piece
-                    case .action(let name):
-                        showAction(name)
+                        // Ряд ответа НЕ создаём здесь — его родит печатная машинка в момент,
+                        // когда покажет первое слово (сдвиг ленты совпадёт с появлением текста).
+                        // Ведущий разделитель «\n\n» нового слоя гасим (после break сервер
+                        // шлёт его первой дельтой — для клиентов, клеящих всё в одну строку).
+                        received += received.isEmpty ? String(piece.drop(while: { $0.isNewline })) : piece
+                    case .action(let label):
+                        showAction(label)
+                    case .textBreak:
+                        closeReply()   // мозг начал новый текст-блок — следующая дельта откроет новый пузырь
                     case .file(let rel):
                         showFile(rel)
                     case .silent:
@@ -556,9 +575,9 @@ struct ChatView: View {
             await typewriter.value        // дать словам дотечь
             if let r = index(replyID) {
                 if received.isEmpty && messages[r].files.isEmpty {
-                    messages.remove(at: r)   // тихий ход — палочка исчезает без следа
+                    messages.remove(at: r)   // тихий ход — пустой ряд исчезает без следа
                 } else if received.isEmpty {
-                    messages[r].isStreaming = false   // только фото, без букв — палочку гасим
+                    messages[r].isStreaming = false   // только фото, без букв — ряд застывает
                 } else {
                     messages[r].text = received
                     // Ждём, пока волна последнего слова доиграет (0.35 с), и застываем.
@@ -693,27 +712,20 @@ struct MessageBubble: View {
         }
     }
 
-    // Плашка «что Наоми делает»: спиннер пока живая, галочка — когда дело сделано.
+    // Плашка «что Наоми делает»: голый приглушённый текст, без пузыря и иконок (act-layer
+    // из веба). Пока дело живое — по тексту зациклено ходит светлая волна («фонарик»,
+    // как у Claude/ChatGPT); застыло — тот же текст, только чуть тише.
     private var actionChip: some View {
         HStack {
-            HStack(spacing: 7) {
-                if message.isLive {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.secondary)
-                } else {
-                    Image(systemName: "checkmark")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.secondary)
-                }
+            if message.isLive {
+                ShimmerText(text: message.text)
+            } else {
                 Text(message.text)
-                    .font(.caption)
+                    .font(.system(size: naomiChipFontSize))
                     .foregroundStyle(.secondary)
+                    .opacity(0.75)   // завершённый шаг тише активного (act-done из веба)
                     .contentTransition(.opacity)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(Color.naomiBubble.opacity(0.55), in: Capsule())
             Spacer(minLength: 48)
         }
     }
@@ -732,7 +744,7 @@ struct MessageBubble: View {
                     }
                     if !message.text.isEmpty {
                         Text(markdownText)
-                            .font(.body)
+                            .font(.system(size: naomiChatFontSize))
                             .foregroundStyle(Color.primary)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 10)
@@ -743,9 +755,6 @@ struct MessageBubble: View {
         } else {
             // Текст от края до края: слева — где раньше была граница пузыря,
             // справа — зеркально, без резерва под «хвост» чужих пузырей.
-            // Живой ход: пока букв нет — на месте будущей первой буквы пульсирует
-            // палочка; перед первой буквой она схлопывается в себя (pillarCollapsed
-            // взводит пейсинг), и текст рождается ровно на её месте, без отступов.
             VStack(alignment: .leading, spacing: 6) {
                 if !message.files.isEmpty {
                     MsgAttachments(files: message.files, onTapImage: onTapImage)
@@ -755,19 +764,15 @@ struct MessageBubble: View {
                         if message.isStreaming && message.text.isEmpty {
                             // Невидимая «буква» держит высоту ряда ровно как у первой
                             // строки будущего текста (тот же шрифт, те же отступы) —
-                            // при подмене палочки на текст чат не сдвигается ни на пиксель.
-                            Text(" ")
-                                .hidden()
-                                .overlay(alignment: .leading) {
-                                    PulsingPillar(collapsed: message.pillarCollapsed)
-                                }
+                            // текст рождается на готовом месте, лента не прыгает.
+                            Text(" ").hidden()
                         } else if #available(iOS 18.0, *), message.isStreaming {
                             FadeInText(text: message.text)   // слова проявляются волной
                         } else {
                             Text(markdownText)
                         }
                     }
-                    .font(.body)
+                    .font(.system(size: naomiChatFontSize))
                     .foregroundStyle(Color.primary)
                     .opacity(message.isError ? 0.7 : 1)
                 }
@@ -794,16 +799,16 @@ struct MessageBubble: View {
 private struct FadeInText: View {
     let text: String
     // Сколько глифов уже полностью видно; анимируется — волна ползёт по новым буквам.
-    // Палочка-пульс здесь НЕ живёт (она — отдельный оверлей): текст не перерисовывается
-    // покадрово, и волна через animatableData работает без конфликтов.
+    // Индикаторам тут не место (грабли: покадровая перерисовка рендерера сбрасывает
+    // animatableData) — текст не перерисовывается покадрово, и волна работает без конфликтов.
     @State private var visible: Double = 0
 
     var body: some View {
         Text(Self.markdown(text))
             .textRenderer(WordFadeRenderer(visible: visible))
             .onAppear {
-                // Вид рождается уже с первым словом (до этого на месте текста жила
-                // палочка) — проявляем это слово с нуля, той же волной.
+                // Вид рождается уже с первым словом (до этого ряд стоял пустым) —
+                // проявляем это слово с нуля, той же волной.
                 visible = 0
                 withAnimation(.easeOut(duration: 0.35)) { visible = Double(text.count) }
             }
@@ -857,25 +862,43 @@ private struct WordFadeRenderer: TextRenderer {
     }
 }
 
-// Палочка-пульс на месте будущего ответа (аналог sp-pillar из веба): вертикальный
-// брусок дышит — сжимается до 55% и бледнеет, затем наливается. Цикл 1.4 с.
-// collapsed = true → схлопывается в себя и исчезает (перед первой буквой ответа).
-private struct PulsingPillar: View {
-    var collapsed = false
-    @State private var up = false
+// Живая подпись дела: по приглушённому тексту слева направо зациклено проходит
+// светлая полоса — «фонарик», сигнал «Наоми делает это прямо сейчас в фоне».
+// Аналог sp-shimmer из веба (styles.css), тот же период 2.2 с. Волна — градиентная
+// полоса поверх текста, обрезанная маской по глифам; TimelineView двигает её покадрово
+// (withAnimation тут не годится: repeatForever не пересчитал бы ход при смене подписи,
+// а contentTransition-морф текста живёт своей жизнью под волной).
+private struct ShimmerText: View {
+    let text: String
+    private static let period: Double = 2.2   // полный проход волны, как shimmer-slide в вебе
 
     var body: some View {
-        RoundedRectangle(cornerRadius: 1.5)
-            .fill(Color.naomiAccent)
-            .frame(width: 3, height: 17)
-            .scaleEffect(y: up ? 1 : 0.55)
-            .scaleEffect(collapsed ? 0.01 : 1)   // схлопывание в точку
-            .opacity(collapsed ? 0 : (up ? 1 : 0.45))
-            .onAppear {
-                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
-                    up = true
+        label
+            .overlay {
+                // SwiftUI. — обязательно: TimelineView без префикса это наш экран таймлайна дома
+                SwiftUI.TimelineView(.animation) { context in
+                    GeometryReader { geo in
+                        let phase = (context.date.timeIntervalSinceReferenceDate / Self.period)
+                            .truncatingRemainder(dividingBy: 1)
+                        let band = max(geo.size.width * 0.45, 36)   // ширина «луча»; короткой подписи — минимум
+                        LinearGradient(
+                            colors: [.clear, Color.primary.opacity(0.85), .clear],
+                            startPoint: .leading, endPoint: .trailing
+                        )
+                        .frame(width: band)
+                        .offset(x: -band + (geo.size.width + band) * phase)
+                    }
                 }
+                .mask(label)
+                .allowsHitTesting(false)
             }
+    }
+
+    private var label: some View {
+        Text(text)
+            .font(.system(size: naomiChipFontSize))
+            .foregroundStyle(.secondary)
+            .contentTransition(.opacity)
     }
 }
 
