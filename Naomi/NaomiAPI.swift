@@ -99,7 +99,8 @@ enum NaomiAPI {
         let segments: [HistorySegment]?   // слои «сложного» хода (пишет бэкенд, см. chat.js)
     }
     // Слой хода из истории: text | action | file — зеркало кадров живого стрима.
-    private struct HistorySegment: Decodable {
+    // Не private: те же слои приходят догоняющим буфером в живом канале (BusEvent.segs).
+    struct HistorySegment: Decodable {
         let kind: String
         let text: String?    // text: кусок ответа между делами
         let name: String?    // action: имя инструмента; file: путь на складе
@@ -461,6 +462,63 @@ enum NaomiAPI {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    // ── Живой канал (GET /api/events, SSE) ──
+    // Одна общая шина сервера (backend/core/bus.js): живой идущий ход (ev "live"* —
+    // start/catchup/delta/action/tool/break/file/silent/error/end, см. core/live.js) и
+    // проактивные сообщения (incoming — автоматика, напоминалки, зеркало телеграма).
+    // Приложение слушает её постоянно и рисует ход вживую, даже если его запустили не с
+    // телефона или телефон перезашёл посреди хода. Свой ход (пока приложение само его
+    // стримит через /api/chat) из канала не дублируем — гейт по sending в ChatView.
+
+    struct BusEvent: Decodable {
+        let type: String          // "live" | "incoming" | "orders_badge" | "tg_live" | ...
+        let ev: String?           // live: start|catchup|delta|action|tool|break|file|silent|error|end
+        let channel: String?
+        let d: String?            // live delta: кусок текста
+        let name: String?         // live action/file: имя инструмента / путь файла
+        let q: String?            // live tool: запрос веб-поиска
+        let sub: Int?             // 1 — дело фоновой помощницы
+        let content: String?      // live end / incoming: авторитетный текст
+        let role: String?         // incoming: user | assistant
+        let files: [String]?      // live end / incoming: файлы
+        let error: Bool?          // live end: мозг упал молча
+        let segs: [HistorySegment]?   // live catchup: что в ходе уже произошло (слои)
+    }
+
+    static func events() -> AsyncThrowingStream<BusEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var req = URLRequest(url: base.appendingPathComponent("api/events"))
+                    // Сервер пингует раз в 25 с — таймаут 60 с с запасом; молчание дольше =
+                    // обрыв (фон/рестарт сервера), слушатель в ChatView переподключится сам.
+                    req.timeoutInterval = 60
+                    authorize(&req)
+                    let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                        throw URLError(.badServerResponse)
+                    }
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data: "),
+                              let ev = try? JSONDecoder().decode(BusEvent.self, from: Data(line.dropFirst(6).utf8))
+                        else { continue }   // пинги «: ping» и служебные строки пропускаем
+                        continuation.yield(ev)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    // Слои догоняющего буфера → ряды ленты (тот же разворот, что у истории): показать
+    // перезашедшему клиенту, что в идущем ходе уже произошло, до прихода живых кадров.
+    static func liveRows(fromSegments segs: [HistorySegment]) -> [ChatMessage] {
+        layerRows(segs) ?? []
     }
 }
 

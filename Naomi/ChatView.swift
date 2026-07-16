@@ -1,6 +1,7 @@
 // Экран чата — как веб-вкладка, один в один: лента пузырей сверху, поле ввода снизу.
 import SwiftUI
 import PhotosUI
+import UIKit   // фоновая передышка (beginBackgroundTask), чтобы короткий ответ дошёл при сворачивании
 
 // Фото, выбранное к отправке: миниатюра на руках сразу, загрузка на склад — в фоне.
 struct PendingAttachment: Identifiable {
@@ -98,12 +99,30 @@ struct ChatView: View {
     // Настоящий отступ чёлки от RootView: контейнер экранов растянут на весь
     // дисплей, «родные» отступы safe area внутри обнулены (см. RootView).
     @Environment(\.naomiTopInset) private var topInset
+    // Фаза сцены: возврат из фона — повод тихо перечитать историю (Мак мог дописать
+    // ответ или прислать автоматику/напоминалку, пока телефон спал). См. .onChange ниже.
+    @Environment(\.scenePhase) private var scenePhase
     // Холодный старт — сразу со слепком с телефона: чат виден мгновенно,
     // сеть догоняет в фоне (loadHistory) и тихо обновляет, если что-то изменилось.
     @State private var messages: [ChatMessage] = ChatCache.load()
     @State private var input = ""
     @State private var sending = false
     @State private var loadError: String?
+    // Свернули приложение прямо во время ответа? Тогда обрыв стрима — это НЕ «не
+    // дозвонилась» (Мак на месте, ход доигрывает сам), а сигнал подтянуть готовый ответ
+    // из истории при возврате. Ставится в .onChange(scenePhase), гасится в начале send().
+    @State private var leftForegroundMidSend = false
+    // Живой ход из общего канала /api/events (запущен НЕ с телефона — телеграм/автоматика —
+    // или нами, но приложение перезашло посреди): рисуем теми же плашками/стримом, что и свой
+    // ход. Ряды помечаем в liveRowIDs, чтобы сбросить всю группу разом при пересборке/обрыве.
+    @State private var liveActive = false
+    @State private var liveChipID: UUID?
+    @State private var liveReplyID: UUID?
+    @State private var liveRowIDs: [UUID] = []
+    @State private var busTask: Task<Void, Never>?
+    // Уходили в настоящий фон? На возврате пересобираем живой ход и сверяемся с историей
+    // (пока спали, ход мог закончиться или уйти дальше). Отличаем фон от транзитного .inactive.
+    @State private var wasBackgrounded = false
     @State private var showSettings = false
     @FocusState private var inputFocused: Bool
     // Отложенные прокрутки (под клавиатуру и под рост поля) держим в классе-коробке,
@@ -189,6 +208,29 @@ struct ChatView: View {
                 inputFocused = true
             }
             await loadHistory()
+            startBus()   // живой канал: слушаем идущий ход и проактивные сообщения, сам переподключается
+        }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                wasBackgrounded = true
+                // Уходим в фон посреди отправки — запомним: обрыв стрима будет ложным.
+                if sending { leftForegroundMidSend = true }
+            case .active:
+                // Только настоящий возврат из фона (не транзитный .inactive от шторки или
+                // переключателя приложений). Пока спали, живой ход мог закончиться или уйти
+                // дальше: сбрасываем его призрак, сверяемся с историей и переподключаем канал
+                // сразу (не ждём таймаута мёртвого сокета). Во время своей отправки историю
+                // не трогаем — там свой доподхват в конце хода (см. send()).
+                if wasBackgrounded {
+                    wasBackgrounded = false
+                    liveReset()
+                    if !sending { Task { await loadHistory() } }
+                    startBus()
+                }
+            default:
+                break
+            }
         }
     }
 
@@ -496,9 +538,9 @@ struct ChatView: View {
             let fresh = Array(try await NaomiAPI.history().suffix(ChatCache.limit))
             loadError = nil
             ChatCache.save(fresh)
-            // Живой ход не трогаем: подмена ленты посреди стрима снесла бы растущий
-            // пузырь. Слепок на диске уже свежий — на следующем старте подхватится.
-            guard !sending else { return }
+            // Живой ход не трогаем: подмена ленты посреди стрима (своего ИЛИ пришедшего из
+            // канала) снесла бы растущий пузырь. Слепок на диске уже свежий.
+            guard !sending, !liveActive else { return }
             // Сеть совпала со слепком с телефона — не дёргаем ленту (и прокрутку) зря.
             if !sameConversation(fresh, messages) {
                 messages = fresh
@@ -515,6 +557,173 @@ struct ChatView: View {
         a.count == b.count && zip(a, b).allSatisfy {
             $0.role == $1.role && $0.kind == $1.kind && $0.text == $1.text && $0.files == $1.files
         }
+    }
+
+    // ── Живой канал (/api/events): идущий ход вживую + проактивные сообщения ──
+    // Слушаем общую шину сервера постоянно. Свой ход (пока приложение само стримит его через
+    // /api/chat) из канала НЕ дублируем — гейт по sending. Всё прочее (ход, запущенный из
+    // телеграма/автоматикой, или свой ход после перезахода) рисуем вживую теми же плашками/
+    // стримом, а в конце сверяемся с историей — она истина.
+
+    private func startBus() {
+        busTask?.cancel()
+        busTask = Task { @MainActor in await listenBus() }
+    }
+
+    private func listenBus() async {
+        while !Task.isCancelled {
+            do {
+                for try await ev in NaomiAPI.events() {
+                    if Task.isCancelled { break }
+                    applyBus(ev)
+                }
+            } catch {
+                // обрыв (фон, рестарт сервера, таймаут молчания) — ниже пауза и заново
+            }
+            if Task.isCancelled { break }
+            try? await Task.sleep(for: .seconds(2))   // не долбим сервер, пока недоступен
+        }
+    }
+
+    private func applyBus(_ ev: NaomiAPI.BusEvent) {
+        // Свой ход рисует /api/chat-стрим — его эхо из канала не дублируем.
+        guard !sending else { return }
+        switch ev.type {
+        case "live":     applyLive(ev)
+        case "incoming": applyIncoming(ev)
+        default:         break   // orders_badge, tg_live (телеграм-зеркало веба) — не наши
+        }
+    }
+
+    private func applyLive(_ ev: NaomiAPI.BusEvent) {
+        switch ev.ev {
+        case "start":
+            liveBegin(seed: [])
+        case "catchup":
+            liveBegin(seed: ev.segs.map { NaomiAPI.liveRows(fromSegments: $0) } ?? [])
+        case "delta":
+            if let d = ev.d { liveDelta(d) }
+        case "action":
+            liveAction(ActionLabels.label(name: ev.name ?? "", sub: ev.sub == 1))
+        case "tool":
+            liveAction(ActionLabels.label(name: "WebSearch", q: ev.q, sub: ev.sub == 1))
+        case "break":
+            liveCloseText()
+        case "file":
+            if let rel = ev.name, !rel.isEmpty { liveFile(rel) }
+        case "end":
+            liveEndTurn()
+        default:
+            break   // silent/error — финал end покажет истину
+        }
+    }
+
+    // Начать/пересобрать живой ход. seed — ряды догоняющего буфера (catchup) или пусто (start).
+    private func liveBegin(seed: [ChatMessage]) {
+        liveReset()
+        liveActive = true
+        for row in seed {
+            messages.append(row)
+            liveRowIDs.append(row.id)
+        }
+        // Хвост буфера продолжаем вживую: текст — дописываем дельтами, плашку — оживляем волной.
+        if let last = messages.last, liveRowIDs.contains(last.id),
+           let i = messages.firstIndex(where: { $0.id == last.id }) {
+            if messages[i].kind == .action { messages[i].isLive = true; liveChipID = last.id }
+            else if messages[i].kind == .text { messages[i].isStreaming = true; liveReplyID = last.id }
+        }
+    }
+
+    // Убрать ряды текущего живого хода (обрыв/пересборка). Свой поток и историю не трогает.
+    private func liveReset() {
+        if !liveRowIDs.isEmpty {
+            let ids = Set(liveRowIDs)
+            messages.removeAll { ids.contains($0.id) }
+        }
+        liveRowIDs = []
+        liveChipID = nil
+        liveReplyID = nil
+        liveActive = false
+    }
+
+    private func liveDelta(_ piece: String) {
+        liveActive = true
+        if let cid = liveChipID, let i = messages.firstIndex(where: { $0.id == cid }) {
+            messages[i].isLive = false   // пошёл текст — живая плашка застыла
+        }
+        liveChipID = nil
+        if let rid = liveReplyID, let i = messages.firstIndex(where: { $0.id == rid }) {
+            messages[i].text += piece
+        } else {
+            let clean = String(piece.drop(while: { $0.isNewline }))   // ведущий разделитель слоя гасим
+            guard !clean.isEmpty else { return }
+            var reply = ChatMessage(role: .assistant, text: clean, kind: .text)
+            reply.isStreaming = true
+            messages.append(reply)
+            liveReplyID = reply.id
+            liveRowIDs.append(reply.id)
+        }
+    }
+
+    private func liveAction(_ label: String) {
+        liveActive = true
+        liveCloseText()
+        if let cid = liveChipID, let i = messages.firstIndex(where: { $0.id == cid }) {
+            withAnimation(.easeInOut(duration: 0.2)) { messages[i].text = label }   // та же плашка перетекает
+        } else {
+            var chip = ChatMessage(role: .assistant, text: label, kind: .action)
+            chip.isLive = true
+            messages.append(chip)
+            liveChipID = chip.id
+            liveRowIDs.append(chip.id)
+        }
+    }
+
+    private func liveCloseText() {
+        guard let rid = liveReplyID, let i = messages.firstIndex(where: { $0.id == rid }) else { liveReplyID = nil; return }
+        if messages[i].text.isEmpty && messages[i].files.isEmpty {
+            messages.remove(at: i)
+            liveRowIDs.removeAll { $0 == rid }
+        } else {
+            messages[i].isStreaming = false
+        }
+        liveReplyID = nil
+    }
+
+    private func liveFile(_ rel: String) {
+        liveActive = true
+        liveCloseText()
+        if let cid = liveChipID, let i = messages.firstIndex(where: { $0.id == cid }) {
+            messages[i].isLive = false
+        }
+        liveChipID = nil
+        var m = ChatMessage(role: .assistant, text: "")
+        m.files = [rel]
+        messages.append(m)
+        liveRowIDs.append(m.id)
+    }
+
+    // Ход из канала закончился: застудить плашку/текст и подменить живые ряды сохранённым
+    // ходом из истории (сегменты, файлы, финальный текст) — она истина.
+    private func liveEndTurn() {
+        if let cid = liveChipID, let i = messages.firstIndex(where: { $0.id == cid }) { messages[i].isLive = false }
+        if let rid = liveReplyID, let i = messages.firstIndex(where: { $0.id == rid }) { messages[i].isStreaming = false }
+        liveActive = false
+        liveChipID = nil
+        liveReplyID = nil
+        liveRowIDs = []
+        Task { await loadHistory() }
+    }
+
+    // Проактивное сообщение вне живого хода (автоматика, напоминалка, зеркало телеграма).
+    private func applyIncoming(_ ev: NaomiAPI.BusEvent) {
+        let text = ev.content ?? ""
+        let files = ev.files ?? []
+        guard text != "[тихо]", !(text.isEmpty && files.isEmpty) else { return }   // тихий ход не рисуем
+        var msg = ChatMessage(role: ev.role == "user" ? .user : .assistant, text: text)
+        msg.files = files
+        messages.append(msg)
+        ChatCache.save(messages)
     }
 
     // Ход Наоми рисуется слоями, как в вебе: живая плашка «что делаю» отдельным
@@ -534,6 +743,7 @@ struct ChatView: View {
         input = ""
         pendingAtts = []
         sending = true
+        leftForegroundMidSend = false   // новый ход — прошлый «свернули» не в счёт
         var userMsg = ChatMessage(role: .user, text: text)
         userMsg.files = atts.map(\.name)
         messages.append(userMsg)
@@ -648,6 +858,15 @@ struct ChatView: View {
         }
 
         Task { @MainActor in
+            // Держим сетевой ход живым ещё немного, если Слава свернёт приложение прямо
+            // во время ответа: короткий ответ успевает дойти целиком, без обрыва. Дольше
+            // (~30 с) iOS фон не даёт — тогда ход доигрывается на Маке, а телефон заберёт
+            // его из истории при возврате (см. leftForegroundMidSend в конце хода).
+            var bgTask: UIBackgroundTaskIdentifier = .invalid
+            bgTask = UIApplication.shared.beginBackgroundTask(withName: "naomi-chat") {
+                UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid
+            }
+            defer { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) } }
             do {
                 for try await event in NaomiAPI.send(text, attachments: atts) {
                     switch event {
@@ -673,7 +892,13 @@ struct ChatView: View {
                 if let c = index(chipID) { messages[c].isLive = false }
             } catch {
                 streamDone = true
-                fail("Не дозвонилась до Наоми. Проверь Wi-Fi и что Мак не спит.")
+                // Обрыв из-за сворачивания приложения — НЕ «не дозвонилась»: Мак на месте
+                // и дописывает ответ сам, заберём его из истории в конце хода. Ложную
+                // ошибку показываем только при настоящем обрыве (Мак спит / не тот Wi-Fi),
+                // когда приложение всё это время оставалось на переднем плане.
+                if !leftForegroundMidSend {
+                    fail("Не дозвонилась до Наоми. Проверь Wi-Fi и что Мак не спит.")
+                }
             }
             await typewriter.value        // дать словам дотечь
             if let r = index(replyID) {
@@ -692,6 +917,11 @@ struct ChatView: View {
             }
             sending = false
             ChatCache.save(messages)   // ход закончен — слепок на телефоне свежий
+            // Прервались сворачиванием — забираем с Мака то, что он дописал, пока телефон
+            // был заморожен: оборванный на полуслове живой кусок сменяется готовым ответом.
+            if leftForegroundMidSend {
+                await loadHistory()
+            }
         }
     }
 }
