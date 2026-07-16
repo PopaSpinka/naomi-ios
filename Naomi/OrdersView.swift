@@ -98,7 +98,7 @@ struct OrdersView: View {
             .navigationBarTitleDisplayMode(.inline)
         }
         // Кнопка-корзина Идей — парит стеклом справа, вровень с кнопкой шторки
-        // слева (как шестерёнка в чате). В корзине прячется, а шторка — «назад».
+        // слева. В корзине прячется, а шторка — «назад».
         .overlay(alignment: .topTrailing) {
             if scope == .ideas && !showingTrash {
                 GlassCircleButton(systemName: "trash") {

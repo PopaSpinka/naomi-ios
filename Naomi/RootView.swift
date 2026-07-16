@@ -38,6 +38,8 @@ enum NaomiSection: String, CaseIterable, Identifiable {
 struct RootView: View {
     @State private var section: NaomiSection = .chat
     @State private var menuOpen = false
+    // Настройки — не раздел, а модалка поверх всего: открываются из низа шторки.
+    @State private var showSettings = false
     // Корзина Идей открывается поверх экрана своей кнопкой-стеклом справа
     // (в OrdersView). Пока она открыта — кнопка шторки слева становится «назад».
     @State private var ideasTrashOpen = false
@@ -50,7 +52,7 @@ struct RootView: View {
             let drawerWidth = min(geo.size.width * 0.66, 272)
 
             ZStack(alignment: .leading) {
-                SideMenu(current: section, onSelect: select)
+                SideMenu(current: section, onSelect: select, onSettings: openSettings)
                     .frame(width: drawerWidth)
                     // Контейнер растянут на физический экран (ignoresSafeArea ниже),
                     // так что чёлку и подбородок шторка отступает сама.
@@ -137,10 +139,15 @@ struct RootView: View {
             // зону не трогаем, ввод как ездил за клавиатурой, так и ездит.
             .ignoresSafeArea(.container)
             // Внутри растянутого контейнера «родные» отступы safe area обнулены —
-            // пробрасываем настоящий отступ чёлки экранам (нужен шестерёнке в чате).
+            // пробрасываем настоящий отступ чёлки экранам (нужен корзине в Идеях).
             .environment(\.naomiTopInset, geo.safeAreaInsets.top)
         }
         .background(Color.naomiBg.ignoresSafeArea())
+        // Экран настроек (тот же, что был за шестерёнкой в чате). После «Готово»
+        // шлём сигнал — чат перечитает историю, если адрес или пропуск сменились.
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet { NotificationCenter.default.post(name: .naomiSettingsSaved, object: nil) }
+        }
         // ГЛОБАЛЬНОГО жеста-свайпа тут больше нет — и не вешать: распознаватель
         // на весь экран участвует в каждом касании и отменяет нажатия кнопок,
         // стоит пальцу дрогнуть на пару точек (стекло мигает, действие не
@@ -197,6 +204,11 @@ struct RootView: View {
         closeMenu()
     }
 
+    private func openSettings() {
+        closeMenu()
+        showSettings = true
+    }
+
     private func openMenu() {
         // Клавиатуру — вниз: шторка рядом с торчащей клавиатурой смотрится ломано.
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
@@ -215,6 +227,7 @@ struct RootView: View {
 private struct SideMenu: View {
     let current: NaomiSection
     var onSelect: (NaomiSection) -> Void
+    var onSettings: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -229,38 +242,52 @@ private struct SideMenu: View {
             }
 
             Spacer()
+
+            // Настройки — не раздел, поэтому вне списка и без пилюли выделения:
+            // прижаты к самому низу шторки, как аккаунт в приложении Claude.
+            Button(action: onSettings) {
+                rowLabel(icon: "gearshape", title: "Настройки", selected: false)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 10)
+            .padding(.bottom, 10)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func row(_ s: NaomiSection) -> some View {
         Button { onSelect(s) } label: {
-            HStack(spacing: 14) {
-                Image(systemName: s.icon)
-                    .font(.title3)
-                    .frame(width: 30)
-                Text(s.title)
-                    .font(.title3)
-            }
-            .foregroundStyle(Color.primary)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background {
-                if s == current {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(Color.naomiBubble)
-                }
-            }
-            .contentShape(Rectangle())
+            rowLabel(icon: s.icon, title: s.title, selected: s == current)
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 10)
     }
+
+    // Общий вид ряда шторки — у разделов и у настроек один рисунок.
+    private func rowLabel(icon: String, title: String, selected: Bool) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: icon)
+                .font(.title3)
+                .frame(width: 30)
+            Text(title)
+                .font(.title3)
+        }
+        .foregroundStyle(Color.primary)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            if selected {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.naomiBubble)
+            }
+        }
+        .contentShape(Rectangle())
+    }
 }
 
-// Круглая стеклянная кнопка поверх шапки — шторка слева, шестерёнка справа
-// (в ChatView). Не в тулбаре: системные кнопки шапки при нажатии раздуваются
+// Круглая стеклянная кнопка поверх шапки — шторка слева, корзина Идей справа
+// (в OrdersView). Не в тулбаре: системные кнопки шапки при нажатии раздуваются
 // и режутся о её потолок. Стекло то же, что у системных; interactive — родной
 // блик и продавливание. Стиль кнопки — обычный, как у рабочей кнопки отправки.
 struct GlassCircleButton: View {

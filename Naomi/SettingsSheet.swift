@@ -1,10 +1,18 @@
-// Настройки: адрес сервера Наоми. Пригодится, когда появится Tailscale
-// или сервер переедет — без пересборки приложения.
+// Настройки: две дороги к Наоми — по дому (имя Мака в сети) и из мира (туннель).
+// Приложение выбирает дорогу само (NaomiAPI.reroute), тут только адреса и пропуск.
+// Открываются из низа шторки (RootView), а не из чата.
 import SwiftUI
+
+// Сигнал «настройки сохранены»: RootView шлёт его после «Готово», чат слушает,
+// перевыбирает дорогу и перечитывает историю — адреса или пропуск могли смениться.
+extension Notification.Name {
+    static let naomiSettingsSaved = Notification.Name("naomiSettingsSaved")
+}
 
 struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("serverURL") private var serverURL = NaomiAPI.defaultBase
+    @AppStorage("serverLocal") private var serverLocal = NaomiAPI.defaultLocal
+    @AppStorage("serverTunnel") private var serverTunnel = ""
     @AppStorage("apiToken") private var apiToken = ""
     var onSave: () -> Void = {}
 
@@ -12,14 +20,25 @@ struct SettingsSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("http://адрес:8787", text: $serverURL)
+                    TextField("http://имя-мака.local:8787", text: $serverLocal)
                         .keyboardType(.URL)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                 } header: {
-                    Text("Адрес сервера")
+                    Text("Дорога по дому")
                 } footer: {
-                    Text("Наоми живёт на Маке, приложение ходит к нему по домашнему Wi-Fi. Адрес — это имя Мака в сети: http://имя-мака.local:8787 (имя видно в macOS: Настройки → Основные → Общий доступ).")
+                    Text("Имя Мака в домашней сети (macOS: Настройки → Основные → Общий доступ). Живёт даже без интернета и не ломается, когда роутер после перезагрузки раздаёт новые адреса.")
+                }
+
+                Section {
+                    TextField("https://адрес-туннеля", text: $serverTunnel)
+                        .keyboardType(.URL)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                } header: {
+                    Text("Дорога из мира")
+                } footer: {
+                    Text("Туннель Cloudflare. Приложение сначала стучится по дому; дверь молчит — молча уходит сюда. Для этой дороги нужен пропуск ниже.")
                 }
 
                 Section {
@@ -29,12 +48,12 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Пропуск")
                 } footer: {
-                    Text("Нужен, когда Наоми открыта в интернет через туннель — значение NAOMI_API_TOKEN из backend/.env на Маке. Дома по Wi-Fi можно оставить пустым.")
+                    Text("Значение NAOMI_API_TOKEN из backend/.env на Маке. Дома по Wi-Fi не нужен, через туннель — обязателен.")
                 }
 
                 Section {
-                    Button("Вернуть стандартный адрес") {
-                        serverURL = NaomiAPI.defaultBase
+                    Button("Вернуть домашний адрес") {
+                        serverLocal = NaomiAPI.defaultLocal
                     }
                     .tint(.naomiAccent)
                 }

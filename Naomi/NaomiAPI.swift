@@ -1,7 +1,8 @@
 // Клиент сервера Наоми — ходит на те же /api/*, что и веб-вкладка.
-// Адрес сервера задаётся в настройках приложения (шестерёнка) и хранится в UserDefaults.
-// Удобнее указывать Мак по имени в домашней сети — `имя-мака.local` (см. «Общий доступ»
-// в настройках macOS): имя стабильнее IP, роутер может выдать Маку другой адрес.
+// К Маку ведут ДВЕ дороги (обе — в настройках-шестерёнке, хранятся в UserDefaults):
+// дома — напрямую по имени Мака в сети (mDNS: переживает смену IP от роутера),
+// из мира — туннель Cloudflare с пропуском. Приложение выбирает дорогу само:
+// домашняя дверь отвечает — ходим по дому, молчит — через туннель (reroute ниже).
 import Foundation
 import UIKit
 
@@ -10,11 +11,81 @@ private extension Data {
 }
 
 enum NaomiAPI {
-    static let defaultBase = "http://mac.local:8787"
+    // ── Две дороги ──
+
+    // Нейтральный образец: реальное имя Мака Слава вписывает в настройках
+    // (публичная гигиена репо — настоящий адрес в код не попадает).
+    static let defaultLocal = "http://mac.local:8787"
+
+    // Старые настройки хранили один адрес (serverURL) — при первом запуске новой
+    // версии раскладываем его по двум полям: https-адрес был туннелем, http — домом.
+    static func migrateSettings() {
+        let d = UserDefaults.standard
+        guard d.string(forKey: "serverLocal") == nil, d.string(forKey: "serverTunnel") == nil,
+              let old = d.string(forKey: "serverURL")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !old.isEmpty else { return }
+        if old.hasPrefix("https://") {
+            d.set(defaultLocal, forKey: "serverLocal")
+            d.set(old, forKey: "serverTunnel")
+            d.set("tunnel", forKey: "route")   // старая дорога проверена жизнью — с неё и начнём
+        } else {
+            d.set(old, forKey: "serverLocal")
+        }
+    }
+
+    static var localBase: String {
+        let v = UserDefaults.standard.string(forKey: "serverLocal")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return v.isEmpty ? defaultLocal : v
+    }
+
+    static var tunnelBase: String {
+        UserDefaults.standard.string(forKey: "serverTunnel")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    // Куда ходим сейчас: "local" | "tunnel". В UserDefaults — последняя рабочая
+    // дорога переживает перезапуск приложения, старт идёт сразу по ней.
+    private static var route: String {
+        get { UserDefaults.standard.string(forKey: "route") ?? "local" }
+        set { UserDefaults.standard.set(newValue, forKey: "route") }
+    }
 
     static var base: URL {
-        let raw = UserDefaults.standard.string(forKey: "serverURL") ?? defaultBase
-        return URL(string: raw) ?? URL(string: defaultBase)!
+        let raw = (route == "tunnel" && !tunnelBase.isEmpty) ? tunnelBase : localBase
+        return URL(string: raw) ?? URL(string: defaultLocal)!
+    }
+
+    // Перевыбор дороги: домашняя всегда предпочтительнее (быстро, бесплатно, живёт
+    // даже без интернета) — стучимся к Маку коротко; молчит — туннель, если задан.
+    // Зовётся при старте, возврате из фона, после «Готово» в настройках и из
+    // dataRerouting/send при сетевом сбое.
+    static func reroute() async {
+        if await localAlive() { route = "local"; return }
+        if !tunnelBase.isEmpty { route = "tunnel" }
+    }
+
+    // Короткий стук в домашнюю дверь: GET /api/health (дома пропуск не нужен).
+    private static func localAlive() async -> Bool {
+        guard let url = URL(string: localBase)?.appendingPathComponent("api/health") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2.5
+        guard let (_, resp) = try? await URLSession.shared.data(for: req) else { return false }
+        return (resp as? HTTPURLResponse)?.statusCode == 200
+    }
+
+    // Одиночный запрос с запасной дорогой: сетевой сбой → перевыбрать дорогу и
+    // повторить один раз (запрос собирается в замыкании заново — уже от новой base).
+    // Отмену не повторяем: это не сеть упала, это ушёл сам вызов. Ошибки HTTP
+    // (401/500) сюда не попадают — сервер жив, дорога рабочая.
+    private static func dataRerouting(_ make: () -> URLRequest) async throws -> (Data, URLResponse) {
+        do {
+            return try await URLSession.shared.data(for: make())
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { throw error }
+            await reroute()
+            return try await URLSession.shared.data(for: make())
+        }
     }
 
     // Пропуск для доступа из большого мира (NAOMI_API_TOKEN на сервере).
@@ -44,9 +115,11 @@ enum NaomiAPI {
     // Скачивает картинку склада с пропуском и ужимает до maxPixel по длинной стороне
     // (миниатюре хватает малого, полный экран — покрупнее; беречь память).
     static func loadImage(rel: String, maxPixel: CGFloat, trash: Bool = false) async throws -> UIImage {
-        var req = URLRequest(url: fileURL(rel, trash: trash))
-        authorize(&req)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await dataRerouting {
+            var req = URLRequest(url: fileURL(rel, trash: trash))
+            authorize(&req)
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200, let img = UIImage(data: data) else {
             throw URLError(.cannotDecodeContentData)
         }
@@ -67,24 +140,25 @@ enum NaomiAPI {
     }
 
     static func upload(data: Data, filename: String) async throws -> UploadedAttachment {
-        var req = URLRequest(url: base.appendingPathComponent("api/upload"))
-        req.httpMethod = "POST"
         let boundary = "naomi-ios-" + UUID().uuidString
-        req.setValue("multipart/form-data; boundary=" + boundary, forHTTPHeaderField: "Content-Type")
-        // CSRF-замок сервера: не-JSON POST без этого заголовка отбивается (403 forbidden).
-        req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-        req.timeoutInterval = 300   // большие фото по Wi-Fi
-        authorize(&req)
-
         var body = Data()
         body.appendString("--\(boundary)\r\n")
         body.appendString("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n")
         body.appendString("Content-Type: application/octet-stream\r\n\r\n")
         body.append(data)
         body.appendString("\r\n--\(boundary)--\r\n")
-        req.httpBody = body
 
-        let (respData, resp) = try await URLSession.shared.data(for: req)
+        let (respData, resp) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent("api/upload"))
+            req.httpMethod = "POST"
+            req.setValue("multipart/form-data; boundary=" + boundary, forHTTPHeaderField: "Content-Type")
+            // CSRF-замок сервера: не-JSON POST без этого заголовка отбивается (403 forbidden).
+            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
+            req.timeoutInterval = 300   // большие фото по Wi-Fi
+            authorize(&req)
+            req.httpBody = body
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
         return try JSONDecoder().decode(UploadedAttachment.self, from: respData)
     }
@@ -109,9 +183,11 @@ enum NaomiAPI {
     }
 
     static func history() async throws -> [ChatMessage] {
-        var req = URLRequest(url: base.appendingPathComponent("api/history"))
-        authorize(&req)
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, _) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent("api/history"))
+            authorize(&req)
+            return req
+        }
         let parsed = try JSONDecoder().decode(HistoryResponse.self, from: data)
         var out: [ChatMessage] = []
         for m in parsed.messages {
@@ -205,12 +281,14 @@ enum NaomiAPI {
     }
 
     fileprivate static func fetchOrders(status: String) async throws -> [Order] {
-        var comps = URLComponents(url: base.appendingPathComponent("api/orders"), resolvingAgainstBaseURL: false)!
-        comps.queryItems = [URLQueryItem(name: "status", value: status)]
-        var req = URLRequest(url: comps.url!)
-        req.timeoutInterval = 15
-        authorize(&req)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await dataRerouting {
+            var comps = URLComponents(url: base.appendingPathComponent("api/orders"), resolvingAgainstBaseURL: false)!
+            comps.queryItems = [URLQueryItem(name: "status", value: status)]
+            var req = URLRequest(url: comps.url!)
+            req.timeoutInterval = 15
+            authorize(&req)
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
         return try JSONDecoder().decode(OrdersResponse.self, from: data).orders
     }
@@ -218,14 +296,17 @@ enum NaomiAPI {
     // Действия над поручениями: create/update/trash/restore/purge/ack/reopen —
     // те же ручки, что жмёт веб; тело — JSON, ответ не разбираем (после — reload).
     static func orderPost(_ path: String, body: [String: Any]) async throws {
-        var req = URLRequest(url: base.appendingPathComponent(path))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-        req.timeoutInterval = 15
-        authorize(&req)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        let payload = try JSONSerialization.data(withJSONObject: body)
+        let (_, resp) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent(path))
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
+            req.timeoutInterval = 15
+            authorize(&req)
+            req.httpBody = payload
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
     }
 
@@ -248,10 +329,12 @@ enum NaomiAPI {
     private struct FilesResponse: Decodable { let files: [FileEntry] }
 
     private static func fetchFiles(_ path: String) async throws -> [FileEntry] {
-        var req = URLRequest(url: base.appendingPathComponent(path))
-        req.timeoutInterval = 15
-        authorize(&req)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent(path))
+            req.timeoutInterval = 15
+            authorize(&req)
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
         let dec = JSONDecoder()
         dec.keyDecodingStrategy = .convertFromSnakeCase   // deleted_ts → deletedTs
@@ -264,25 +347,30 @@ enum NaomiAPI {
     // Действие над файлом: api/files/delete (в корзину), api/files/restore,
     // api/files/annotate (Наоми рассмотрит файл и занесёт карточку).
     static func fileAction(_ path: String, rel: String) async throws {
-        var req = URLRequest(url: base.appendingPathComponent(path))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-        req.timeoutInterval = 15
-        authorize(&req)
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["rel": rel])
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        let payload = try JSONSerialization.data(withJSONObject: ["rel": rel])
+        let (_, resp) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent(path))
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
+            req.timeoutInterval = 15
+            authorize(&req)
+            req.httpBody = payload
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
     }
 
     // Очистка корзины — единственное необратимое действие склада.
     static func emptyTrash() async throws {
-        var req = URLRequest(url: base.appendingPathComponent("api/trash/empty"))
-        req.httpMethod = "POST"
-        req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-        req.timeoutInterval = 15
-        authorize(&req)
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        let (_, resp) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent("api/trash/empty"))
+            req.httpMethod = "POST"
+            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
+            req.timeoutInterval = 15
+            authorize(&req)
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
     }
 
@@ -308,10 +396,12 @@ enum NaomiAPI {
     private struct TimelineResponse: Decodable { let events: [TimelineEvent] }
 
     static func timeline() async throws -> [TimelineEvent] {
-        var req = URLRequest(url: base.appendingPathComponent("api/timeline"))
-        req.timeoutInterval = 10
-        authorize(&req)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent("api/timeline"))
+            req.timeoutInterval = 10
+            authorize(&req)
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
         return try JSONDecoder().decode(TimelineResponse.self, from: data).events
     }
@@ -368,23 +458,28 @@ enum NaomiAPI {
     }
 
     static func home() async throws -> HomeState {
-        var req = URLRequest(url: base.appendingPathComponent("api/home"))
-        req.timeoutInterval = 10
-        authorize(&req)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent("api/home"))
+            req.timeoutInterval = 10
+            authorize(&req)
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
         return try decodeHome(data)
     }
 
     static func patchHome(_ patch: [String: Any]) async throws -> HomeState {
-        var req = URLRequest(url: base.appendingPathComponent("api/home"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-        req.timeoutInterval = 15
-        authorize(&req)
-        req.httpBody = try JSONSerialization.data(withJSONObject: patch)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let payload = try JSONSerialization.data(withJSONObject: patch)
+        let (data, resp) = try await dataRerouting {
+            var req = URLRequest(url: base.appendingPathComponent("api/home"))
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
+            req.timeoutInterval = 15
+            authorize(&req)
+            req.httpBody = payload
+            return req
+        }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
         return try decodeHome(data)
     }
@@ -417,47 +512,60 @@ enum NaomiAPI {
     static func send(_ text: String, attachments: [UploadedAttachment] = []) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
-                do {
-                    var req = URLRequest(url: base.appendingPathComponent("api/chat"))
-                    req.httpMethod = "POST"
-                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    authorize(&req)
-                    // Пауза между кадрами: сервер шлёт пульс каждые 15 сек, так что 120 — с запасом.
-                    req.timeoutInterval = 120
-                    let body: [String: Any] = [
-                        "messages": [["role": "user", "content": text]],
-                        "channel": "ios",   // Наоми видит в сводке, что Слава пишет из приложения
-                        "attachments": attachments.map { [
-                            "name": $0.name,
-                            "model": $0.model,
-                            "origin": $0.origin ?? $0.name,
-                            "dup": $0.dup ?? false,
-                        ] },
-                    ]
-                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let body: [String: Any] = [
+                    "messages": [["role": "user", "content": text]],
+                    "channel": "ios",   // Наоми видит в сводке, что Слава пишет из приложения
+                    "attachments": attachments.map { [
+                        "name": $0.name,
+                        "model": $0.model,
+                        "origin": $0.origin ?? $0.name,
+                        "dup": $0.dup ?? false,
+                    ] },
+                ]
+                // Две попытки: сбой ДО первого кадра — перевыбрать дорогу и зайти ещё раз
+                // (ход ещё не начался, повтор безопасен). Кадры уже шли → не повторяем:
+                // ход идёт на сервере, при обрыве он доиграется сам, история подберёт.
+                var gotFrames = false
+                for attempt in 0..<2 {
+                    do {
+                        var req = URLRequest(url: base.appendingPathComponent("api/chat"))
+                        req.httpMethod = "POST"
+                        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                        authorize(&req)
+                        // Пауза между кадрами: сервер шлёт пульс каждые 15 сек, так что 120 — с запасом.
+                        req.timeoutInterval = 120
+                        req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-                    let (bytes, response) = try await URLSession.shared.bytes(for: req)
-                    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                        throw URLError(.badServerResponse)
-                    }
-                    for try await line in bytes.lines {
-                        guard line.hasPrefix("data: "),
-                              let frame = try? JSONDecoder().decode(Frame.self, from: Data(line.dropFirst(6).utf8))
-                        else { continue }   // пульсы «: hb» и служебные строки пропускаем
-                        switch frame.t {
-                        case "delta": continuation.yield(.delta(frame.d ?? ""))
-                        case "action": continuation.yield(.action(ActionLabels.label(name: frame.name ?? "", sub: frame.sub == 1)))
-                        case "tool": continuation.yield(.action(ActionLabels.label(name: "WebSearch", q: frame.q, sub: frame.sub == 1)))
-                        case "break": continuation.yield(.textBreak)
-                        case "file": if let rel = frame.name, !rel.isEmpty { continuation.yield(.file(rel)) }
-                        case "silent": continuation.yield(.silent)
-                        case "error": continuation.yield(.failure)
-                        default: break
+                        let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                            throw URLError(.badServerResponse)
                         }
+                        for try await line in bytes.lines {
+                            guard line.hasPrefix("data: "),
+                                  let frame = try? JSONDecoder().decode(Frame.self, from: Data(line.dropFirst(6).utf8))
+                            else { continue }   // пульсы «: hb» и служебные строки пропускаем
+                            gotFrames = true
+                            switch frame.t {
+                            case "delta": continuation.yield(.delta(frame.d ?? ""))
+                            case "action": continuation.yield(.action(ActionLabels.label(name: frame.name ?? "", sub: frame.sub == 1)))
+                            case "tool": continuation.yield(.action(ActionLabels.label(name: "WebSearch", q: frame.q, sub: frame.sub == 1)))
+                            case "break": continuation.yield(.textBreak)
+                            case "file": if let rel = frame.name, !rel.isEmpty { continuation.yield(.file(rel)) }
+                            case "silent": continuation.yield(.silent)
+                            case "error": continuation.yield(.failure)
+                            default: break
+                            }
+                        }
+                        continuation.finish()
+                        return
+                    } catch {
+                        if gotFrames || attempt == 1 || error is CancellationError
+                            || (error as? URLError)?.code == .cancelled {
+                            continuation.finish(throwing: error)
+                            return
+                        }
+                        await reroute()
                     }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
                 }
             }
             continuation.onTermination = { _ in task.cancel() }

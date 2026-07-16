@@ -4,6 +4,10 @@ import SwiftUI
 
 @main
 struct NaomiApp: App {
+    // Старые настройки хранили один адрес сервера — раскладываем по двум дорогам
+    // (дом/туннель) до первого запроса, см. NaomiAPI.migrateSettings.
+    init() { NaomiAPI.migrateSettings() }
+
     var body: some Scene {
         WindowGroup {
             RootView()

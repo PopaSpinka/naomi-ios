@@ -96,9 +96,6 @@ private enum MarkdownCache {
 }
 
 struct ChatView: View {
-    // Настоящий отступ чёлки от RootView: контейнер экранов растянут на весь
-    // дисплей, «родные» отступы safe area внутри обнулены (см. RootView).
-    @Environment(\.naomiTopInset) private var topInset
     // Фаза сцены: возврат из фона — повод тихо перечитать историю (Мак мог дописать
     // ответ или прислать автоматику/напоминалку, пока телефон спал). См. .onChange ниже.
     @Environment(\.scenePhase) private var scenePhase
@@ -123,7 +120,6 @@ struct ChatView: View {
     // Уходили в настоящий фон? На возврате пересобираем живой ход и сверяемся с историей
     // (пока спали, ход мог закончиться или уйти дальше). Отличаем фон от транзитного .inactive.
     @State private var wasBackgrounded = false
-    @State private var showSettings = false
     @FocusState private var inputFocused: Bool
     // Отложенные прокрутки (под клавиатуру и под рост поля) держим в классе-коробке,
     // а НЕ в @State: переустановка задачи не должна перерисовывать экран. Раньше они
@@ -170,23 +166,16 @@ struct ChatView: View {
                 // проезжают под него и под клавиатуру, а система рисует под баром тот же
                 // эффект «в размытие и затемнение», что и под шапкой (iOS 26).
                 .floatingInputBar { inputBar }
-                .navigationTitle("Наоми")
-                .navigationBarTitleDisplayMode(.inline)
-                .sheet(isPresented: $showSettings) {
-                    SettingsSheet { Task { await loadHistory() } }
-                }
+                // Шапка теперь своя (см. headerBar): системный навбар прячем целиком.
+                // Пустой системный титул не годился — с ним iOS перестаёт рисовать
+                // затемнение края при прокрутке, а сдвинуть его к центру кнопки шторки
+                // или пустить по нему волну нельзя. Свой бар тем же механизмом, что
+                // поле ввода снизу — родное затемнение возвращается (см. floatingHeaderBar).
+                .floatingHeaderBar { headerBar }
+                .toolbar(.hidden, for: .navigationBar)
                 .fullScreenCover(item: $lightbox) { item in
                     LightboxView(rel: item.rel)
                 }
-            }
-            // Шестерёнка — парит поверх шапки, не в тулбаре: системную кнопку
-            // при нажатии раздувало стеклом и резало о потолок шапки (та же
-            // болячка, что была у кнопки шторки — см. RootView). Отступ чёлки —
-            // вручную из naomiTopInset, вровень с кнопкой шторки слева.
-            .overlay(alignment: .topTrailing) {
-                GlassCircleButton(systemName: "gearshape") { showSettings = true }
-                    .padding(.trailing, 18)
-                    .padding(.top, topInset + 4)
             }
 
             // Заставка холодного старта (уловка Claude): пока под ней чат встаёт на
@@ -207,6 +196,7 @@ struct ChatView: View {
                 withAnimation(.easeOut(duration: 0.60)) { showSplash = false }
                 inputFocused = true
             }
+            await NaomiAPI.reroute()   // выбрать дорогу (дом/туннель) до первого запроса
             await loadHistory()
             startBus()   // живой канал: слушаем идущий ход и проактивные сообщения, сам переподключается
         }
@@ -225,13 +215,46 @@ struct ChatView: View {
                 if wasBackgrounded {
                     wasBackgrounded = false
                     liveReset()
-                    if !sending { Task { await loadHistory() } }
+                    // Пока спали, могли переехать (дом ↔ мир) — перевыбираем дорогу.
+                    if !sending { Task { await NaomiAPI.reroute(); await loadHistory() } }
                     startBus()
                 }
             default:
                 break
             }
         }
+        // Настройки живут в шторке (RootView) и открываются поверх всего приложения.
+        // После «Готово» адрес сервера или пропуск могли смениться — перечитываем
+        // историю уже у нового адреса. Сигнал шлёт RootView (см. .naomiSettingsSaved).
+        .onReceive(NotificationCenter.default.publisher(for: .naomiSettingsSaved)) { _ in
+            Task {
+                await NaomiAPI.reroute()   // адреса сменились — выбрать дорогу заново
+                await loadHistory()
+                startBus()                 // и переподключить живой канал к новому адресу
+            }
+        }
+    }
+
+    // Шапка: «Наоми» в стеклянной капсуле справа (зеркально кнопке шторки слева —
+    // тот же отступ 18 и высота 44; бар сам отступает чёлку, +4 как у кнопки в
+    // RootView — центры совпадают). Пока идёт ход (свой после отправки или живой из
+    // другого канала), надпись гаснет до плашечной и по ней бежит «фонарик», как по
+    // делам в ленте, только луч уже, ярче и шустрее — короткому слову мягкий
+    // плашечный пресет почти не виден.
+    private var headerBar: some View {
+        let busy = sending || liveActive
+        return Text("Наоми")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(busy ? Color.secondary : Color.primary)
+            .modifier(ShimmerIf(active: busy, period: 1.4, minBand: 0, peak: 1.0))
+            .padding(.horizontal, 18)
+            .frame(height: 44)
+            .titleGlassBackground()
+            .padding(.top, 4)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.trailing, 18)
+            .animation(.easeInOut(duration: 0.25), value: busy)
+            .allowsHitTesting(false)
     }
 
     // Экран-заставка: чистый тёплый фон, без надписи — бесшовно продолжает
@@ -581,6 +604,7 @@ struct ChatView: View {
                 // обрыв (фон, рестарт сервера, таймаут молчания) — ниже пауза и заново
             }
             if Task.isCancelled { break }
+            await NaomiAPI.reroute()   // дорога могла умереть — перевыбрать (дом приоритетен)
             try? await Task.sleep(for: .seconds(2))   // не долбим сервер, пока недоступен
         }
     }
@@ -998,6 +1022,31 @@ private extension View {
         }
     }
 
+    // Шапка тем же механизмом, что поле ввода: safeAreaBar сверху + родное
+    // прогрессивное затемнение края при заезде ленты под бар (системный навбар
+    // спрятан — с пустым титулом iOS такого затемнения не рисовала вовсе).
+    @ViewBuilder
+    func floatingHeaderBar<Bar: View>(@ViewBuilder _ bar: @escaping () -> Bar) -> some View {
+        if #available(iOS 26.0, *) {
+            self
+                .safeAreaBar(edge: .top, spacing: 0, content: bar)
+                .scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            self.safeAreaInset(edge: .top, spacing: 0, content: bar)
+        }
+    }
+
+    // «Облачко» надписи в шапке — то же стекло, что у кнопки шторки, только
+    // капсулой и без interactive (надпись не нажимается). Фолбэк — матовый пузырь.
+    @ViewBuilder
+    func titleGlassBackground() -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular, in: Capsule())
+        } else {
+            self.background(Color.naomiBubble, in: Capsule())
+        }
+    }
+
     // Следим, у дна ли прокрутка (запас ~150 пт) и листал ли пользователь рукой.
     // Возврат на дно (любым способом) сбрасывает «листал»; жест пальцем — взводит.
     // На старых iOS ничего не отслеживаем — поведение просто остаётся прежним.
@@ -1212,43 +1261,66 @@ private struct WordFadeRenderer: TextRenderer {
     }
 }
 
-// Живая подпись дела: по приглушённому тексту слева направо зациклено проходит
-// светлая полоса — «фонарик», сигнал «Наоми делает это прямо сейчас в фоне».
+// Бегущая светлая волна — «фонарик», сигнал «Наоми делает это прямо сейчас в фоне».
 // Аналог sp-shimmer из веба (styles.css), тот же период 2.2 с. Волна — градиентная
-// полоса поверх текста, обрезанная маской по глифам; TimelineView двигает её покадрово
-// (withAnimation тут не годится: repeatForever не пересчитал бы ход при смене подписи,
-// а contentTransition-морф текста живёт своей жизнью под волной).
+// полоса поверх текста, обрезанная маской по его же глифам; TimelineView двигает её
+// покадрово (withAnimation тут не годится: repeatForever не пересчитал бы ход при
+// смене подписи, а contentTransition-морф текста живёт своей жизнью под волной).
+// Общая для плашек дел в ленте и надписи «Наоми» в шапке (когда она думает).
+extension View {
+    // По умолчанию — пресет плашек дел (период 2.2 с, мягкий луч с минимумом 36 пт).
+    // Шапка зовёт со своими: короткому слову «Наоми» луч в 36 пт — почти во всю
+    // ширину, «бега» не видно, поэтому там луч уже, ярче и период короче.
+    func naomiShimmer(period: Double = 2.2, minBand: CGFloat = 36, peak: Double = 0.85) -> some View {
+        overlay {
+            // SwiftUI. — обязательно: TimelineView без префикса это наш экран таймлайна дома
+            SwiftUI.TimelineView(.animation) { context in
+                GeometryReader { geo in
+                    let phase = (context.date.timeIntervalSinceReferenceDate / period)
+                        .truncatingRemainder(dividingBy: 1)
+                    let band = max(geo.size.width * 0.45, minBand)   // ширина «луча»
+                    LinearGradient(
+                        colors: [.clear, Color.primary.opacity(peak), .clear],
+                        startPoint: .leading, endPoint: .trailing
+                    )
+                    .frame(width: band)
+                    .offset(x: -band + (geo.size.width + band) * phase)
+                }
+            }
+            .mask(self)
+            .allowsHitTesting(false)
+        }
+    }
+}
+
+// Волна по условию — для надписи «Наоми» в шапке. Отдельный модификатор, а не
+// if в месте употребления, чтобы в покое не оставался TimelineView(.animation):
+// он гонит кадры без остановки, в тихой шапке ему делать нечего.
+struct ShimmerIf: ViewModifier {
+    let active: Bool
+    var period: Double = 2.2
+    var minBand: CGFloat = 36
+    var peak: Double = 0.85
+
+    func body(content: Content) -> some View {
+        if active {
+            content.naomiShimmer(period: period, minBand: minBand, peak: peak)
+        } else {
+            content
+        }
+    }
+}
+
+// Живая подпись дела: приглушённый текст плашки + волна поверх.
 private struct ShimmerText: View {
     let text: String
-    private static let period: Double = 2.2   // полный проход волны, как shimmer-slide в вебе
 
     var body: some View {
-        label
-            .overlay {
-                // SwiftUI. — обязательно: TimelineView без префикса это наш экран таймлайна дома
-                SwiftUI.TimelineView(.animation) { context in
-                    GeometryReader { geo in
-                        let phase = (context.date.timeIntervalSinceReferenceDate / Self.period)
-                            .truncatingRemainder(dividingBy: 1)
-                        let band = max(geo.size.width * 0.45, 36)   // ширина «луча»; короткой подписи — минимум
-                        LinearGradient(
-                            colors: [.clear, Color.primary.opacity(0.85), .clear],
-                            startPoint: .leading, endPoint: .trailing
-                        )
-                        .frame(width: band)
-                        .offset(x: -band + (geo.size.width + band) * phase)
-                    }
-                }
-                .mask(label)
-                .allowsHitTesting(false)
-            }
-    }
-
-    private var label: some View {
         Text(text)
             .font(.system(size: naomiChipFontSize))
             .foregroundStyle(.secondary)
             .contentTransition(.opacity)
+            .naomiShimmer()
     }
 }
 
