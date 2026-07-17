@@ -104,19 +104,18 @@ enum NaomiAPI {
     // ── Файлы со склада (фото в чате) ──
 
     // Адрес файла по относительному пути склада: сегменты кодируем по одному,
-    // чтобы кириллица и пробелы в именах не ломали URL. trash — файл из корзины
-    // (склад его уже не отдаёт, у корзины свой маршрут).
-    static func fileURL(_ rel: String, trash: Bool = false) -> URL {
-        var url = base.appendingPathComponent(trash ? "api/trash/file" : "api/file")
+    // чтобы кириллица и пробелы в именах не ломали URL.
+    static func fileURL(_ rel: String) -> URL {
+        var url = base.appendingPathComponent("api/file")
         for part in rel.split(separator: "/") { url.appendPathComponent(String(part)) }
         return url
     }
 
     // Скачивает картинку склада с пропуском и ужимает до maxPixel по длинной стороне
     // (миниатюре хватает малого, полный экран — покрупнее; беречь память).
-    static func loadImage(rel: String, maxPixel: CGFloat, trash: Bool = false) async throws -> UIImage {
+    static func loadImage(rel: String, maxPixel: CGFloat) async throws -> UIImage {
         let (data, resp) = try await dataRerouting {
-            var req = URLRequest(url: fileURL(rel, trash: trash))
+            var req = URLRequest(url: fileURL(rel))
             authorize(&req)
             return req
         }
@@ -237,251 +236,6 @@ enum NaomiAPI {
             }
         }
         return out.isEmpty ? nil : out
-    }
-
-    // ── Поручения: напоминания / заметки / идеи — та же база, что видит Наоми ──
-    // Карточки живут в core/orders.js; сторож проверяет условия на сервере.
-    // Приложению хватает читаемых полей — trig/action в UI не разбираем.
-
-    struct Order: Decodable {
-        let id: Int
-        let kind: String?         // remind | note | idea | auto
-        let title: String?
-        let status: String?       // active | paused | done | trash
-        let pendingAck: Int?      // 1 = сработало/висит — ждёт галочку «сделал»
-        let humanWhen: String?    // условие по-человечески («каждый день в 09:00»)
-        let humanDo: String?      // действие по-человечески (у автоматики)
-        let fireCount: Int?
-        let lastFired: Int?
-        let notify: Int?          // автоматика: писать в чат при срабатывании
-        let repeatFlag: Int?      // постоянное (repeat — слово Swift, потому Flag)
-
-        // Ключи явные: repeat не назвать полем, а остальные — snake_case сервера.
-        enum CodingKeys: String, CodingKey {
-            case id, kind, title, status, notify
-            case pendingAck = "pending_ack"
-            case humanWhen = "human_when"
-            case humanDo = "human_do"
-            case fireCount = "fire_count"
-            case lastFired = "last_fired"
-            case repeatFlag = "repeat"
-        }
-    }
-
-    private struct OrdersResponse: Decodable { let orders: [Order] }
-
-    // Четыре вкладки Поручений (идеи/заметки/напоминалки/автоматика) тянут ОДИН и тот
-    // же список — каждая фильтрует по своему виду уже у себя. На холодном старте и на
-    // общем 60-секундном тике это било 8 одинаковых запросов разом. Склейка вызовов,
-    // летящих в один момент (OrdersInflight), сводит их к одному походу в сеть. Кэша
-    // по времени тут НЕТ намеренно: после действия над карточкой список должен
-    // перечитаться сразу, без застоя.
-    static func orders(status: String) async throws -> [Order] {
-        try await OrdersInflight.shared.get(status: status)
-    }
-
-    fileprivate static func fetchOrders(status: String) async throws -> [Order] {
-        let (data, resp) = try await dataRerouting {
-            var comps = URLComponents(url: base.appendingPathComponent("api/orders"), resolvingAgainstBaseURL: false)!
-            comps.queryItems = [URLQueryItem(name: "status", value: status)]
-            var req = URLRequest(url: comps.url!)
-            req.timeoutInterval = 15
-            authorize(&req)
-            return req
-        }
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-        return try JSONDecoder().decode(OrdersResponse.self, from: data).orders
-    }
-
-    // Действия над поручениями: create/update/trash/restore/purge/ack/reopen —
-    // те же ручки, что жмёт веб; тело — JSON, ответ не разбираем (после — reload).
-    static func orderPost(_ path: String, body: [String: Any]) async throws {
-        let payload = try JSONSerialization.data(withJSONObject: body)
-        let (_, resp) = try await dataRerouting {
-            var req = URLRequest(url: base.appendingPathComponent(path))
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-            req.timeoutInterval = 15
-            authorize(&req)
-            req.httpBody = payload
-            return req
-        }
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-    }
-
-    // ── Файлы: склад и корзина, как вкладка в вебе ──
-    // Склад отдаёт файлы новыми сверху с описью из картотеки; корзина — мягкое
-    // удаление (файл и карточка уезжают вместе, восстановление возвращает оба).
-
-    struct FileEntry: Decodable {
-        let rel: String           // относительный путь склада — ключ всех действий
-        let date: String?         // папка-день «2026-07-13»
-        let time: String?         // «14:32» из имени файла
-        let name: String?         // человеческое имя
-        let kind: String?         // photo | doc
-        let size: Int?            // байты
-        let channel: String?      // web | telegram | inbox
-        let descr: String?        // опись из картотеки (нет — файл «без карточки»)
-        let deletedTs: Int?       // только у корзины: когда удалён
-    }
-
-    private struct FilesResponse: Decodable { let files: [FileEntry] }
-
-    private static func fetchFiles(_ path: String) async throws -> [FileEntry] {
-        let (data, resp) = try await dataRerouting {
-            var req = URLRequest(url: base.appendingPathComponent(path))
-            req.timeoutInterval = 15
-            authorize(&req)
-            return req
-        }
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-        let dec = JSONDecoder()
-        dec.keyDecodingStrategy = .convertFromSnakeCase   // deleted_ts → deletedTs
-        return try dec.decode(FilesResponse.self, from: data).files
-    }
-
-    static func files() async throws -> [FileEntry] { try await fetchFiles("api/files") }
-    static func trashFiles() async throws -> [FileEntry] { try await fetchFiles("api/trash") }
-
-    // Действие над файлом: api/files/delete (в корзину), api/files/restore,
-    // api/files/annotate (Наоми рассмотрит файл и занесёт карточку).
-    static func fileAction(_ path: String, rel: String) async throws {
-        let payload = try JSONSerialization.data(withJSONObject: ["rel": rel])
-        let (_, resp) = try await dataRerouting {
-            var req = URLRequest(url: base.appendingPathComponent(path))
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-            req.timeoutInterval = 15
-            authorize(&req)
-            req.httpBody = payload
-            return req
-        }
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-    }
-
-    // Очистка корзины — единственное необратимое действие склада.
-    static func emptyTrash() async throws {
-        let (_, resp) = try await dataRerouting {
-            var req = URLRequest(url: base.appendingPathComponent("api/trash/empty"))
-            req.httpMethod = "POST"
-            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-            req.timeoutInterval = 15
-            authorize(&req)
-            return req
-        }
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-    }
-
-    // ── Таймлайн дома (GET /api/timeline) — та же лента переходов, что в вебе ──
-    // Сервер отдаёт события новые-сверху и уже всё подписывает: жирную часть,
-    // деталь, кто сделал (Автоматика/Наоми) и длительность состояния.
-
-    struct TimelineEvent: Decodable {
-        let ts: Int               // unix-секунды события
-        let module: String?       // группа для цвета точки («Присутствие», «Телевизор»...)
-        let label: String?        // жирная часть («Слава», «Кондиционер»)
-        let detail: String?       // что случилось («пришёл домой», «выключен»)
-        let sep: String?          // разделитель между ними (сервер шлёт «—»)
-        let source: String?       // кто сделал — рисуется чипом («Автоматика»)
-        let durLabel: String?     // «17 минут» — сколько длилось состояние
-
-        enum CodingKeys: String, CodingKey {
-            case ts, module, label, detail, sep, source
-            case durLabel = "dur_label"
-        }
-    }
-
-    private struct TimelineResponse: Decodable { let events: [TimelineEvent] }
-
-    static func timeline() async throws -> [TimelineEvent] {
-        let (data, resp) = try await dataRerouting {
-            var req = URLRequest(url: base.appendingPathComponent("api/timeline"))
-            req.timeoutInterval = 10
-            authorize(&req)
-            return req
-        }
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-        return try JSONDecoder().decode(TimelineResponse.self, from: data).events
-    }
-
-    // ── Умный дом (GET/POST /api/home) — та же панель, что в вебе ──
-    // GET — живой снимок всех модулей; POST с патчем ({ac:{on:true}}, {tv:{on:false}},
-    // {vacuum:{do:"dock"}}) — команда железу, в ответ сразу свежий снимок.
-
-    struct HomeState: Decodable {
-        struct Weather: Decodable {
-            let ok: Bool?
-            let stale: Bool?
-            let feels: Int?
-            let condition: String?
-            let windMs: Double?
-            let gustMs: Double?
-            let rainProb: Int?
-            let uvBand: String?
-            let isDay: Bool?
-        }
-        struct AC: Decodable {
-            let online: Bool?
-            let on: Bool?
-            let temp: Int?          // целевая
-            let ambient: Double?    // датчик в гостиной
-            let mode: String?       // cool | dry | eco | fan
-            let fan: String?        // auto | low | middle | high
-            let air: String?        // качество воздуха по-русски
-        }
-        struct Vacuum: Decodable {
-            let online: Bool?
-            let battery: Int?
-            let stateRu: String?    // «заряжается», «пылесосит»...
-            let cleanKind: String?  // вид текущей уборки (nil — не убирается)
-            let docked: Bool?
-        }
-        struct TV: Decodable {
-            let online: Bool?
-            let on: Bool?
-        }
-        struct Person: Decodable { let home: Bool? }
-
-        let weather: Weather?
-        let ac: AC?
-        let vacuum: Vacuum?
-        let tv: TV?
-        let presence: [String: Person]?
-    }
-
-    private static func decodeHome(_ data: Data) throws -> HomeState {
-        let dec = JSONDecoder()
-        dec.keyDecodingStrategy = .convertFromSnakeCase   // wind_ms → windMs и т.п.
-        return try dec.decode(HomeState.self, from: data)
-    }
-
-    static func home() async throws -> HomeState {
-        let (data, resp) = try await dataRerouting {
-            var req = URLRequest(url: base.appendingPathComponent("api/home"))
-            req.timeoutInterval = 10
-            authorize(&req)
-            return req
-        }
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-        return try decodeHome(data)
-    }
-
-    static func patchHome(_ patch: [String: Any]) async throws -> HomeState {
-        let payload = try JSONSerialization.data(withJSONObject: patch)
-        let (data, resp) = try await dataRerouting {
-            var req = URLRequest(url: base.appendingPathComponent("api/home"))
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue("1", forHTTPHeaderField: "X-Naomi-Csrf")
-            req.timeoutInterval = 15
-            authorize(&req)
-            req.httpBody = payload
-            return req
-        }
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-        return try decodeHome(data)
     }
 
     // ── Живой ответ (POST /api/chat, поток кадров) ──
@@ -627,24 +381,5 @@ enum NaomiAPI {
     // перезашедшему клиенту, что в идущем ходе уже произошло, до прихода живых кадров.
     static func liveRows(fromSegments segs: [HistorySegment]) -> [ChatMessage] {
         layerRows(segs) ?? []
-    }
-}
-
-// Склейка одновременных запросов Поручений: если несколько вкладок просят один и тот
-// же список в один момент, все ждут ОДНОГО похода в сеть. Держится только «в полёте» —
-// как только запрос завершился, следующий вызов идёт свежим (никакого устаревания
-// после действий над карточками). На главном потоке живёт лишь дешёвая бухгалтерия
-// словаря; сам запрос и разбор JSON идут в стороне (fetchOrders — не на MainActor).
-@MainActor
-private final class OrdersInflight {
-    static let shared = OrdersInflight()
-    private var tasks: [String: Task<[NaomiAPI.Order], Error>] = [:]
-
-    func get(status: String) async throws -> [NaomiAPI.Order] {
-        if let running = tasks[status] { return try await running.value }
-        let task = Task { try await NaomiAPI.fetchOrders(status: status) }
-        tasks[status] = task
-        defer { tasks[status] = nil }
-        return try await task.value
     }
 }

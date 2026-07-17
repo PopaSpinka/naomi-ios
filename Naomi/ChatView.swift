@@ -2,6 +2,7 @@
 import SwiftUI
 import PhotosUI
 import UIKit   // фоновая передышка (beginBackgroundTask), чтобы короткий ответ дошёл при сворачивании
+import ObjectiveC.runtime
 
 // Фото, выбранное к отправке: миниатюра на руках сразу, загрузка на склад — в фоне.
 struct PendingAttachment: Identifiable {
@@ -11,23 +12,519 @@ struct PendingAttachment: Identifiable {
     var failed = false                           // не доехало: ⚠️ на миниатюре, убрать крестиком
 }
 
-// Коробка под отложенные прокрутки. Живёт в @State ради постоянства, но менять её
-// поля можно без перерисовки экрана (ссылка на класс не меняется) — задачам прокрутки
-// незачем инвалидировать ленту. См. комментарий у scrollTasks в ChatView.
+// Коробка внеразметочного состояния прокрутки. Живёт в @State ради постоянства, но
+// менять её поля можно без перерисовки экрана (ссылка на класс не меняется) — задачам
+// прокрутки незачем инвалидировать ленту. См. комментарий у scrollTasks в ChatView.
+// Подъезд ленты за клавиатурой коробка больше не обслуживает: смену РАЗМЕРА вьюпорта
+// ведёт системный якорь (см. bottomAnchoredStart) — сам, синхронно с клавиатурой.
 private final class ScrollTaskBox {
-    var keyboard: Task<Void, Never>?
-    var barGrow: Task<Void, Never>?
     var older: Task<Void, Never>?   // возврат якоря после подгрузки старых сообщений
-    var lastKbH: CGFloat = 0         // прошлая высота клавиатуры — чтобы ловить ТОЛЬКО подъём
+    var tailNudge: Task<Void, Never>?   // мягкий подъезд к дну: новый ряд / новая строка
+}
+
+// Telegram не отдаёт жест системному UIScrollView: он сам ведёт слой клавиатуры и
+// собственную раскладку чата, а потом решает — закрыть её или вернуть пружиной. Ниже
+// тот же приём для тестовой сборки на личный телефон. В iOS НЕТ публичного API для
+// сдвига живой системной клавиатуры: доступ к её окну здесь идёт через runtime. Это
+// намеренно изолировано в одном мосте, имеет fallback (ничего не делает, если iOS
+// изменила внутреннее устройство) и НЕ годится для версии, отправляемой в App Store.
+private enum InteractiveKeyboardFinish {
+    case restore
+    case dismiss
+}
+
+// Единый физический профиль финала: системный слой клавиатуры получает его через
+// Core Animation, а поле ввода — через SwiftUI.
+private enum InteractiveKeyboardMotion {
+    static let mass: Double = 1
+    // Та же форма пружины, но примерно на 20% спокойнее прежней 340/31.
+    // Отношение damping / sqrt(stiffness) сохранено: финал стал медленнее,
+    // не превратившись при этом в резиновый отскок.
+    static let stiffness: Double = 240
+    static let damping: Double = 26
+
+    static func normalizedVelocity(_ rawVelocity: CGFloat) -> Double {
+        max(-4, min(4, Double(rawVelocity / 1_000)))
+    }
+
+    static func animation(initialVelocity: CGFloat) -> Animation {
+        .interpolatingSpring(
+            mass: mass,
+            stiffness: stiffness,
+            damping: damping,
+            initialVelocity: normalizedVelocity(initialVelocity)
+        )
+    }
+}
+
+// Не UIPanGestureRecognizer: тот соревнуется с pan самой ленты и проигрывает ему.
+// Этот recognizer намеренно остаётся .possible до конца касания — как WindowPanRecognizer
+// Telegram — и потому только наблюдает за пальцем, не мешая ни ScrollView, ни TextField.
+private final class PassiveKeyboardPanRecognizer: UIGestureRecognizer {
+    var began: ((CGPoint) -> Void)?
+    var moved: ((CGPoint) -> Void)?
+    var ended: ((CGPoint, CGPoint?) -> Void)?
+
+    private var points: [(CGPoint, CFTimeInterval)] = []
+
+    override func reset() {
+        super.reset()
+        points.removeAll()
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        guard let touch = touches.first else { return }
+        let point = touch.location(in: view)
+        record(point)
+        began?(point)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesMoved(touches, with: event)
+        guard let touch = touches.first else { return }
+        let point = touch.location(in: view)
+        record(point)
+        moved?(point)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesEnded(touches, with: event)
+        guard let touch = touches.first else { return }
+        let point = touch.location(in: view)
+        record(point)
+        ended?(point, CGPoint(x: 0, y: verticalVelocity()))
+        state = .ended
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesCancelled(touches, with: event)
+        let point = touches.first?.location(in: view) ?? .zero
+        ended?(point, nil)
+        state = .cancelled
+    }
+
+    private func record(_ point: CGPoint) {
+        points.append((point, CACurrentMediaTime()))
+        if points.count > 6 { points.removeFirst() }
+    }
+
+    private func verticalVelocity() -> CGFloat {
+        let now = CACurrentMediaTime()
+        var total: CGFloat = 0
+        var count = 0
+        for index in 1..<points.count where points[index].1 >= now - 0.1 {
+            let previous = points[index - 1]
+            let current = points[index]
+            let elapsed = current.1 - previous.1
+            guard elapsed > 0 else { continue }
+            total += (current.0.y - previous.0.y) / elapsed
+            count += 1
+        }
+        // Telegram намеренно приглушает сырую скорость в пять раз, а затем
+        // сравнивает результат с порогом 100. Сохраняем обе части формулы вместе:
+        // это эквивалентно примерно 500 pt/s реальной скорости пальца.
+        return count == 0 ? 0 : total / CGFloat(count * 5)
+    }
+}
+
+private struct TelegramKeyboardPanBridge: UIViewRepresentable {
+    let inputFocused: Bool
+    let keyboardHeight: CGFloat
+    let resetGeneration: Int
+    let onBegin: () -> Void
+    let onOffset: (CGFloat) -> Void
+    let onFinish: (InteractiveKeyboardFinish, CGFloat) -> Void
+    let onAnimationComplete: (InteractiveKeyboardFinish) -> Void
+    let onRequestDismiss: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> KeyboardPanProbe {
+        let probe = KeyboardPanProbe()
+        probe.hostChanged = { [weak coordinator = context.coordinator] window in
+            coordinator?.install(on: window)
+        }
+        return probe
+    }
+
+    func updateUIView(_ probe: KeyboardPanProbe, context: Context) {
+        context.coordinator.update(from: self)
+        // Нужен общий предок ScrollView и поля ввода. superview bridge — всего лишь
+        // прозрачный сосед ленты, на нём UIKit чужие касания не наблюдает.
+        context.coordinator.install(on: probe.window)
+    }
+
+    static func dismantleUIView(_ uiView: KeyboardPanProbe, coordinator: Coordinator) {
+        coordinator.remove()
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        private let pan = PassiveKeyboardPanRecognizer()
+        private weak var installedHost: UIView?
+        private weak var keyboardView: UIView?
+        private var originalBounds: CGRect?
+        private var startPoint: CGPoint?
+        private var keyboardTop: CGFloat?
+        private var activeKeyboardHeight: CGFloat = 0
+        private var moved = false
+        private var completingDismiss = false
+        private var keyboardAnimationDisplayLink: CADisplayLink?
+        private var keyboardAnimationDeadline: CFTimeInterval = 0
+        private var keyboardAnimationFinish: InteractiveKeyboardFinish?
+        private var lastResetGeneration = -1
+
+        private var inputFocused = false
+        private var keyboardHeight: CGFloat = 0
+        private var onBegin: () -> Void = {}
+        private var onOffset: (CGFloat) -> Void = { _ in }
+        private var onFinish: (InteractiveKeyboardFinish, CGFloat) -> Void = { _, _ in }
+        private var onAnimationComplete: (InteractiveKeyboardFinish) -> Void = { _ in }
+        private var onRequestDismiss: () -> Void = {}
+
+        override init() {
+            super.init()
+            pan.delegate = self
+            // Ровно настройки WindowPanRecognizer Telegram: касание не задерживаем
+            // и не отменяем, мы его лишь читаем параллельно с настоящей лентой.
+            pan.cancelsTouchesInView = false
+            pan.delaysTouchesBegan = false
+            pan.delaysTouchesEnded = false
+            pan.began = { [weak self] point in self?.beginTracking(at: point) }
+            pan.moved = { [weak self] point in self?.moveTracking(to: point) }
+            pan.ended = { [weak self] point, velocity in
+                self?.endTracking(at: point, velocity: velocity)
+            }
+        }
+
+        func update(from bridge: TelegramKeyboardPanBridge) {
+            inputFocused = bridge.inputFocused
+            keyboardHeight = bridge.keyboardHeight
+            onBegin = bridge.onBegin
+            onOffset = bridge.onOffset
+            onFinish = bridge.onFinish
+            onAnimationComplete = bridge.onAnimationComplete
+            onRequestDismiss = bridge.onRequestDismiss
+
+            if bridge.resetGeneration != lastResetGeneration {
+                lastResetGeneration = bridge.resetGeneration
+                resetKeyboardLayer()
+            }
+        }
+
+        func install(on host: UIView?) {
+            guard let host, installedHost !== host else { return }
+            installedHost?.removeGestureRecognizer(pan)
+            host.addGestureRecognizer(pan)
+            installedHost = host
+            disableSystemKeyboardDismissal(in: host)
+        }
+
+        func remove() {
+            resetKeyboardLayer()
+            installedHost?.removeGestureRecognizer(pan)
+            installedHost = nil
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            // Telegram отсекает лишь нижние 44 pt (системная полоска/клавиатурный
+            // край), а не всё поле. Поэтому жест, начатый на «облачке» ввода, теперь
+            // тоже живой — именно это ты заметил в Telegram.
+            guard gestureRecognizer === pan, let host = installedHost else { return false }
+            return touch.location(in: host).y < host.bounds.height - 44
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            // Не соревнуемся со скроллом: он продолжает обычную прокрутку, пока
+            // bridge не распознает реальное перетаскивание клавиатуры.
+            if let scrollView = otherGestureRecognizer.view as? UIScrollView,
+               otherGestureRecognizer === scrollView.panGestureRecognizer,
+               scrollView.alwaysBounceVertical || scrollView.contentSize.height > scrollView.bounds.height {
+                scrollView.keyboardDismissMode = .none
+            }
+            return true
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            false
+        }
+
+        private func beginTracking(at point: CGPoint) {
+            guard !completingDismiss else {
+                return
+            }
+            guard let view = findKeyboardView() else {
+                return
+            }
+            let frame = view.convert(view.bounds, to: installedHost)
+            let height = max(keyboardHeight, view.bounds.height)
+            // Контейнер остаётся в дереве и после hide, но уезжает ниже экрана.
+            // Берём реальную геометрию вместо @FocusState: SwiftUI может обновить
+            // binding раньше, чем UIKit закончит живой жест.
+            guard height > 0, !view.isHidden,
+                  frame.minY < (installedHost?.bounds.maxY ?? UIScreen.main.bounds.maxY) - 1 else {
+                return
+            }
+            keyboardView = view
+            originalBounds = view.layer.bounds
+            startPoint = point
+            keyboardTop = frame.minY
+            activeKeyboardHeight = height
+            moved = false
+        }
+
+        private func moveTracking(to point: CGPoint) {
+            guard startPoint != nil, let keyboardView, let originalBounds,
+                  let keyboardTop else { return }
+            // Как в Telegram: лента доезжает до клавиатуры сама, а тянуть её
+            // начинаем ровно с момента, когда палец пересёк верхний край.
+            let offset = min(max(0, point.y - keyboardTop), activeKeyboardHeight)
+            guard offset > 0 else { return }
+            if !moved {
+                moved = true
+                onBegin()
+            }
+            setKeyboardOffset(offset, on: keyboardView, originalBounds: originalBounds)
+            onOffset(offset)
+        }
+
+        private func endTracking(at point: CGPoint, velocity: CGPoint?) {
+            guard moved, let keyboardView, let originalBounds, startPoint != nil else {
+                self.keyboardView = nil
+                self.originalBounds = nil
+                startPoint = nil
+                moved = false
+                return
+            }
+
+            let offset = min(max(0, point.y - (keyboardTop ?? point.y)), activeKeyboardHeight)
+            let verticalVelocity = velocity?.y ?? 0
+            // У Telegram два равноправных финала: клавиатуру либо довели до низа,
+            // либо отпустили с направленной вниз скоростью > 100 после их
+            // нормализации (около 500 pt/s до деления на 5). Оставляем прежний
+            // допуск 8% у физического края, чтобы не менять уже настроенный полный
+            // протяг. Быстрый свайп, лишь задевший клавиатуру, продолжит закрытие
+            // сам; медленный короткий протяг всё ещё вернётся пружиной.
+            let reachedBottom = offset >= activeKeyboardHeight * 0.92
+            let fastDownwardFlick = verticalVelocity > 100
+            let shouldDismiss = velocity != nil && (reachedBottom || fastDownwardFlick)
+            let target = shouldDismiss ? activeKeyboardHeight : 0
+            let animationDuration = animateKeyboard(
+                to: target,
+                on: keyboardView,
+                originalBounds: originalBounds,
+                initialVelocity: verticalVelocity
+            )
+            let finish: InteractiveKeyboardFinish = shouldDismiss ? .dismiss : .restore
+            onFinish(finish, verticalVelocity)
+            followKeyboardAnimation(
+                finish: finish,
+                duration: animationDuration
+            )
+
+            if shouldDismiss {
+                // Bounds нужны до keyboardDidHide: тогда вернём слой в исходное
+                // состояние уже за невидимой клавиатурой, без вспышки при новом фокусе.
+                completingDismiss = true
+            }
+            self.startPoint = nil
+            self.keyboardTop = nil
+            self.activeKeyboardHeight = 0
+            moved = false
+        }
+
+        private func followKeyboardAnimation(finish: InteractiveKeyboardFinish,
+                                             duration: CFTimeInterval) {
+            stopFollowingKeyboardAnimation()
+            keyboardAnimationFinish = finish
+            keyboardAnimationDeadline = CACurrentMediaTime() + duration
+
+            let displayLink = CADisplayLink(
+                target: self,
+                selector: #selector(stepKeyboardAnimation)
+            )
+            keyboardAnimationDisplayLink = displayLink
+            displayLink.add(to: .main, forMode: .common)
+        }
+
+        @objc private func stepKeyboardAnimation(_ displayLink: CADisplayLink) {
+            guard keyboardView != nil, let finish = keyboardAnimationFinish else {
+                stopFollowingKeyboardAnimation()
+                return
+            }
+
+            guard CACurrentMediaTime() >= keyboardAnimationDeadline else { return }
+            stopFollowingKeyboardAnimation()
+            onAnimationComplete(finish)
+
+            if finish == .dismiss {
+                guard completingDismiss else { return }
+                onRequestDismiss()
+            } else {
+                self.keyboardView = nil
+                self.originalBounds = nil
+            }
+        }
+
+        private func stopFollowingKeyboardAnimation() {
+            keyboardAnimationDisplayLink?.invalidate()
+            keyboardAnimationDisplayLink = nil
+            keyboardAnimationFinish = nil
+            keyboardAnimationDeadline = 0
+        }
+
+        private func setKeyboardOffset(_ offset: CGFloat, on view: UIView, originalBounds: CGRect) {
+            var bounds = originalBounds
+            bounds.origin.y -= offset
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            view.layer.removeAnimation(forKey: "naomi.keyboard.spring")
+            view.layer.bounds = bounds
+            CATransaction.commit()
+        }
+
+        private func animateKeyboard(to offset: CGFloat, on view: UIView, originalBounds: CGRect,
+                                     initialVelocity: CGFloat) -> CFTimeInterval {
+            let layer = view.layer
+            let currentY = (layer.presentation() ?? layer).bounds.origin.y
+            var targetBounds = originalBounds
+            targetBounds.origin.y -= offset
+
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.bounds = targetBounds
+            CATransaction.commit()
+
+            let spring = CASpringAnimation(keyPath: "bounds.origin.y")
+            spring.fromValue = currentY
+            spring.toValue = targetBounds.origin.y
+            spring.mass = CGFloat(InteractiveKeyboardMotion.mass)
+            spring.stiffness = CGFloat(InteractiveKeyboardMotion.stiffness)
+            spring.damping = CGFloat(InteractiveKeyboardMotion.damping)
+            spring.initialVelocity = CGFloat(
+                InteractiveKeyboardMotion.normalizedVelocity(initialVelocity)
+            )
+            // Длительность берём из той же физики, а не режем вручную: поле, резерв
+            // чата и клавиатура получают время полностью до точки покоя.
+            spring.duration = spring.settlingDuration
+            layer.add(spring, forKey: "naomi.keyboard.spring")
+            return spring.duration
+        }
+
+        private func resetKeyboardLayer() {
+            stopFollowingKeyboardAnimation()
+            completingDismiss = false
+            startPoint = nil
+            keyboardTop = nil
+            activeKeyboardHeight = 0
+            guard let keyboardView, let originalBounds else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            keyboardView.layer.removeAnimation(forKey: "naomi.keyboard.spring")
+            keyboardView.layer.bounds = originalBounds
+            CATransaction.commit()
+            self.keyboardView = nil
+            self.originalBounds = nil
+        }
+
+        // SwiftUI-модификатор .scrollDismissesKeyboard(.never) на iOS 26 иногда
+        // не доходит до вложенного HostingScrollView. Фиксируем публичный UIKit
+        // режим прямо на настоящем scroll view, чтобы системный pan не скрыл input
+        // до того, как наш bridge успеет вернуть его пружиной.
+        private func disableSystemKeyboardDismissal(in view: UIView) {
+            if let scrollView = view as? UIScrollView {
+                scrollView.keyboardDismissMode = .none
+            }
+            for child in view.subviews {
+                disableSystemKeyboardDismissal(in: child)
+            }
+        }
+
+        // internalGetKeyboard в Telegram — не системный метод UIApplication, а их
+        // собственная Objective-C обёртка над class-методом UIRemoteKeyboardWindow.
+        // Вызываем тот же метод через runtime: это возвращает настоящее удалённое
+        // окно с UIInputSetHostView, слой которого двигает именно клавиши.
+        private func findKeyboardView() -> UIView? {
+            if let keyboardWindow = remoteKeyboardWindow(),
+               let host = keyboardHost(in: keyboardWindow) {
+                return host
+            }
+
+            let keyboardWindows = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows)
+                .filter { window in
+                    let name = NSStringFromClass(type(of: window))
+                    return name.hasSuffix("RemoteKeyboardWindow") || name.hasSuffix("TextEffectsWindow")
+                }
+            for keyboardWindow in keyboardWindows {
+                if let host = keyboardHost(in: keyboardWindow) { return host }
+            }
+            return nil
+        }
+
+        private func remoteKeyboardWindow() -> UIWindow? {
+            guard let windowClass = NSClassFromString("UIRemoteKeyboardWindow") else { return nil }
+            let selector = NSSelectorFromString("remoteKeyboardWindowForScreen:create:")
+            guard let method = class_getClassMethod(windowClass, selector) else { return nil }
+
+            typealias GetRemoteKeyboardWindow = @convention(c) (
+                AnyObject, Selector, AnyObject, Bool
+            ) -> Unmanaged<AnyObject>?
+            let implementation = method_getImplementation(method)
+            let call = unsafeBitCast(implementation, to: GetRemoteKeyboardWindow.self)
+            return call(windowClass, selector, UIScreen.main, false)?.takeUnretainedValue() as? UIWindow
+        }
+
+        private func keyboardHost(in view: UIView) -> UIView? {
+            let name = NSStringFromClass(type(of: view))
+            if name.hasSuffix("InputSetHostView") || name.hasSuffix("KeyboardItemContainerView") {
+                return view
+            }
+            for subview in view.subviews {
+                if let found = keyboardHost(in: subview) { return found }
+            }
+            return nil
+        }
+    }
+
+    final class KeyboardPanProbe: UIView {
+        var hostChanged: ((UIView?) -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            hostChanged?(window)
+        }
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            hostChanged?(window)
+        }
+    }
 }
 
 // Хвост ленты (маркер-«дно») — общий id для колонки пузырей и обработчиков прокрутки.
 private let chatTailID = "chat-tail"
 
+// Высота живой панели меняется при многострочном тексте и вложениях. Ленте нужен
+// ровно такой же нижний inset, пока сама панель рисуется независимым overlay.
+private struct InputBarHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 50
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 // Колонка пузырей вынесена в ОТДЕЛЬНЫЙ Equatable-вид: пока сами сообщения не изменились,
 // SwiftUI её пропускает (== вернёт true) и НЕ пересобирает 80 пузырей. Раньше лента жила
-// прямо в body экрана и перетряхивалась на каждый чих прокрутки (isNearBottom и т.п.) —
-// это и есть тот главный поток, что «поддёргивал» и скролл, и сворачивание клавиатуры.
+// прямо в body экрана и перетряхивалась на каждый чих состояния прокрутки — это и есть
+// тот главный поток, что «поддёргивал» и скролл, и сворачивание клавиатуры.
+// В колонке — только ЗАСТЫВШИЕ ряды (все, кроме последнего): последний ряд во время
+// стрима мутирует каждым словом, и живи он здесь — тик перетряхивал бы все пузыри окна.
+// Он рисуется отдельно, рядом с колонкой (см. messagesList), тик стоит один пузырь.
 // Биндинг lightbox и замыкание onRetry в сравнении не участвуют (их и не с чем сверять),
 // но пишут в стабильное хранилище — работают даже когда вид пропущен.
 private struct BubbleColumn: View, Equatable {
@@ -52,12 +549,7 @@ private struct BubbleColumn: View, Equatable {
                     .padding(.vertical, msg.role == .user ? 4 : 0)
                     .id(msg.id)
             }
-            Color.clear
-                .frame(height: 14)
-                .id(chatTailID)
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 12)
     }
 
     private func errorCard(_ text: String) -> some View {
@@ -121,32 +613,42 @@ struct ChatView: View {
     // (пока спали, ход мог закончиться или уйти дальше). Отличаем фон от транзитного .inactive.
     @State private var wasBackgrounded = false
     @FocusState private var inputFocused: Bool
-    // Отложенные прокрутки (под клавиатуру и под рост поля) держим в классе-коробке,
+    // Отложенные прокрутки (возврат якоря окна и подъезд к дну) держим в классе-коробке,
     // а НЕ в @State: переустановка задачи не должна перерисовывать экран. Раньше они
-    // жили в @State — и каждое событие клавиатуры/поля дёргало пересборку всей ленты
-    // (до 300 пузырей). Ровно это и проседало, когда клавиатуру свайпом ведёшь вниз.
-    // iOS шлёт событие клавиатуры 2–3 раза подряд — прежнюю задачу отменяем, чтобы
-    // движение осталось ровно одно.
+    // жили в @State — и каждая переустановка дёргала пересборку всей ленты.
     @State private var scrollTasks = ScrollTaskBox()
-    // Пользователь у дна ленты? Если он листает старую переписку, клавиатура
-    // не должна утаскивать чат вниз — вниз прокрутит только отправка сообщения.
-    @State private var isNearBottom = true
-    // Листал ли пользователь ленту рукой с тех пор, как она была на дне. Датчик
-    // «у дна» на холодном старте даёт ложное «нет» из-за ленивой разметки, поэтому
-    // блокируем клавиатурный подъезд только по СОЧЕТАНИЮ: далеко от дна И листал сам.
+    // «Якорь сорван»: пользователь взял ленту рукой. Палец срывает якорь МГНОВЕННО —
+    // автопрокрутка стрима не смеет дёргать чат из-под пальца; обратно якорь цепляется,
+    // когда жест улёгся у дна (см. trackScroll), или отправкой сообщения (send()).
     @State private var scrolledAwayByHand = false
-    // Высота поля ввода: когда оно растёт (перенос строки), лента едет вверх,
-    // чтобы последний пузырь не накрывало.
-    @State private var barHeight: CGFloat = 0
-    // Прокрутка под рост поля — та же схема и та же коробка, что у клавиатуры
-    // (scrollTasks выше): новая высота применяется к ленте на следующем проходе
-    // разметки, мгновенный scrollTo целился по старым размерам и не двигал чат.
+    // Лента у дна? (запас 150 пт; перелёт пружины за дно — тоже «у дна».) Нужен одному
+    // месту: тапу в поле ввода во время пружины — факт «доехал до конца» помнится,
+    // даже пока лента отскакивает, и клавиатура поднимает чат с собой (см. onChange
+    // inputFocused). Глубоко в истории остаётся false — там ничего не дёргаем.
+    @State private var isNearBottom = true
+    // Свой интерактивный жест клавиатуры (как у Telegram). Высоту берём из системных
+    // нотификаций, а offset рисуем сами — при таком drag iOS не меняет safe area.
+    @State private var keyboardHeight: CGFloat = 0
+    @State private var keyboardDragOffset: CGFloat = 0
+    @State private var keyboardDragging = false
+    @State private var keyboardResetGeneration = 0
+    // В финале dismiss резерв ленты отрезается одинаково при любой позиции чата.
+    // Отдельной ветки для последнего ответа намеренно нет: она вмешивалась в живой
+    // pan UIScrollView и отстреливала ленту вверх, когда палец заходил на клавиатуру.
+    @State private var chatReserveCut = false
+    // Читаем один раз после первого layout. Нельзя обращаться к window.safeAreaInsets
+    // из computed property body: safeAreaBar сам рассчитывает этот inset и образует
+    // AttributeGraph cycle (чёрный экран).
+    @State private var deviceBottomSafeArea: CGFloat = 34
+    @State private var inputBarHeight: CGFloat = 50
     // Вложения: выбор из фотоплёнки, очередь к отправке, открытое на весь экран фото.
     @State private var pickedItems: [PhotosPickerItem] = []
     @State private var pendingAtts: [PendingAttachment] = []
     @State private var lightbox: LightboxItem?
     // Заставка на холодном старте: прячет, как чат встаёт на место (уловка Claude).
     @State private var showSplash = true
+    // Настройки подключения (две дороги и пропуск) — по тапу на облачко «Наоми» в шапке.
+    @State private var showSettings = false
     // Лента рисует не всю историю разом, а последние windowCount сообщений. Остальное
     // лежит в messages и подтягивается окном при прокрутке вверх (данные уже в памяти —
     // подгрузка мгновенная, без похода в сеть). 300 живых пузырей разом — вот что
@@ -155,28 +657,27 @@ struct ChatView: View {
 
     var body: some View {
         ZStack {
-            NavigationStack {
-                ZStack {
-                    // Фон на весь экран, включая зону за клавиатурой — чтобы при её появлении
-                    // за скруглёнными углами просвечивал интерфейс, а не чёрный провал (как в iMessage).
-                    Color.naomiBg.ignoresSafeArea()
-                    messagesList
-                }
-                // Поле ввода не отрезает ленту, а плавает над ней как системный бар: сообщения
-                // проезжают под него и под клавиатуру, а система рисует под баром тот же
-                // эффект «в размытие и затемнение», что и под шапкой (iOS 26).
-                .floatingInputBar { inputBar }
-                // Шапка теперь своя (см. headerBar): системный навбар прячем целиком.
-                // Пустой системный титул не годился — с ним iOS перестаёт рисовать
-                // затемнение края при прокрутке, а сдвинуть его к центру кнопки шторки
-                // или пустить по нему волну нельзя. Свой бар тем же механизмом, что
-                // поле ввода снизу — родное затемнение возвращается (см. floatingHeaderBar).
-                .floatingHeaderBar { headerBar }
-                .toolbar(.hidden, for: .navigationBar)
-                .fullScreenCover(item: $lightbox) { item in
-                    LightboxView(rel: item.rel)
-                }
+            // Фон остаётся неподвижным, пока весь нижний chat-surface едет за
+            // клавиатурой: иначе сверху на пружине открывался бы пустой участок.
+            Color.naomiBg.ignoresSafeArea()
+
+            ZStack {
+                messagesList
             }
+            .floatingBottomReserve(height: inputBarHeight + chatKeyboardClearance)
+            // Шапка своя — облачко «Наоми» тем же механизмом, что поле ввода снизу
+            // (safeAreaBar даёт родное затемнение края при заезде ленты под бар).
+            // NavigationStack не нужен: навигации в приложении нет, системный навбар
+            // не рисуется, а sheet/fullScreenCover живут на любом виде.
+            .floatingHeaderBar { headerBar }
+            .fullScreenCover(item: $lightbox) { item in
+                LightboxView(rel: item.rel)
+            }
+
+            // Не зависит от keyboard safe area: положение каждый кадр задаём сами
+            // по keyboardHeight − dragOffset. Поэтому у UIKit больше нет второго
+            // layout-прохода, способного отстрелить поле или нижнюю тень.
+            inputChromeLayer
 
             // Заставка холодного старта (уловка Claude): пока под ней чат встаёт на
             // место, наверху — спокойная надпись; тает — а всё уже готово. Клавиатура
@@ -186,6 +687,46 @@ struct ChatView: View {
                     .zIndex(1)
             }
         }
+        // Системная keyboard safe area больше не меняет геометрию этого экрана:
+        // настоящую клавиатуру, панель и нижний резерв ленты ведёт одна и та же
+        // keyboardHeight − keyboardDragOffset. Поэтому у UIKit не остаётся второго
+        // layout-таймлайна после окончания нашей пружины.
+        .ignoresSafeArea(.keyboard, edges: .bottom)
+        // Recognizer висит на окне приложения: жест не обрывается, когда палец из
+        // ленты заезжает на системную клавиатуру. Сам мост прозрачен для обычных тапов.
+        .overlay {
+            TelegramKeyboardPanBridge(
+                inputFocused: inputFocused,
+                keyboardHeight: keyboardHeight,
+                resetGeneration: keyboardResetGeneration,
+                onBegin: beginInteractiveKeyboardDrag,
+                onOffset: updateInteractiveKeyboardDrag,
+                onFinish: finishInteractiveKeyboardDrag,
+                onAnimationComplete: completeInteractiveKeyboardAnimation,
+                onRequestDismiss: { resignFocusInstantly() }
+            )
+            .allowsHitTesting(false)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) {
+            updateKeyboardFrame($0)
+        }
+        .onPreferenceChange(InputBarHeightPreferenceKey.self) { height in
+            guard height > 0, abs(inputBarHeight - height) > 0.5 else { return }
+            inputBarHeight = height
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { _ in
+            // К этому моменту окно клавиатуры уже невидимо: возвращаем его layer
+            // в обычные bounds без вспышки перед следующим открытием.
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                keyboardHeight = 0
+                keyboardDragOffset = 0
+                keyboardDragging = false
+                chatReserveCut = false   // формула при нулях тоже 0 — снятие бесшовно
+            }
+            keyboardResetGeneration &+= 1
+        }
         .task {
             // «Визитку» держит только системный launch screen. Наша копия заставки
             // лишь бесшовно перехватывает его на первом кадре и сразу тает,
@@ -193,8 +734,28 @@ struct ChatView: View {
             // чата за заставкой, глазу она не видна.
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(20))
+                if let inset = UIApplication.shared.connectedScenes
+                    .compactMap({ $0 as? UIWindowScene })
+                    .flatMap(\.windows)
+                    .first(where: \.isKeyWindow)?
+                    .safeAreaInsets.bottom,
+                   inset > 0 {
+                    deviceBottomSafeArea = inset
+                }
                 withAnimation(.easeOut(duration: 0.60)) { showSplash = false }
-                inputFocused = true
+                // Не ждём следующего keyboardWillChangeFrame, чтобы начать подъём
+                // панели: фокус и её ожидаемая высота стартуют одним таймлайном.
+                // Реальную высоту каждой показанной клавиатуры сохраняем ниже.
+                let cachedHeight = CGFloat(
+                    UserDefaults.standard.double(forKey: "naomi.lastKeyboardHeight")
+                )
+                let anticipatedHeight = cachedHeight > deviceBottomSafeArea
+                    ? cachedHeight
+                    : 345
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    keyboardHeight = anticipatedHeight
+                    inputFocused = true
+                }
             }
             await NaomiAPI.reroute()   // выбрать дорогу (дом/туннель) до первого запроса
             await loadHistory()
@@ -223,38 +784,43 @@ struct ChatView: View {
                 break
             }
         }
-        // Настройки живут в шторке (RootView) и открываются поверх всего приложения.
-        // После «Готово» адрес сервера или пропуск могли смениться — перечитываем
-        // историю уже у нового адреса. Сигнал шлёт RootView (см. .naomiSettingsSaved).
-        .onReceive(NotificationCenter.default.publisher(for: .naomiSettingsSaved)) { _ in
-            Task {
-                await NaomiAPI.reroute()   // адреса сменились — выбрать дорогу заново
-                await loadHistory()
-                startBus()                 // и переподключить живой канал к новому адресу
+        // Настройки подключения — по тапу на облачко «Наоми» в шапке. После «Готово»
+        // адрес сервера или пропуск могли смениться — перевыбираем дорогу, перечитываем
+        // историю уже у нового адреса и переподключаем живой канал.
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet {
+                Task {
+                    await NaomiAPI.reroute()
+                    await loadHistory()
+                    startBus()
+                }
             }
         }
     }
 
-    // Шапка: «Наоми» в стеклянной капсуле справа (зеркально кнопке шторки слева —
-    // тот же отступ 18 и высота 44; бар сам отступает чёлку, +4 как у кнопки в
-    // RootView — центры совпадают). Пока идёт ход (свой после отправки или живой из
-    // другого канала), надпись гаснет до плашечной и по ней бежит «фонарик», как по
-    // делам в ленте, только луч уже, ярче и шустрее — короткому слову мягкий
-    // плашечный пресет почти не виден.
+    // Шапка: облачко «Наоми» в стеклянной капсуле по центру — единственная кнопка
+    // приложения, тап открывает настройки подключения. Пока идёт ход (свой после
+    // отправки или живой из другого канала), надпись гаснет до плашечной и по ней
+    // бежит «фонарик», как по делам в ленте, только луч уже, ярче и шустрее —
+    // короткому слову мягкий плашечный пресет почти не виден.
     private var headerBar: some View {
         let busy = sending || liveActive
-        return Text("Наоми")
-            .font(.system(size: 17, weight: .semibold))
-            .foregroundStyle(busy ? Color.secondary : Color.primary)
-            .modifier(ShimmerIf(active: busy, period: 1.4, minBand: 0, peak: 1.0))
-            .padding(.horizontal, 18)
-            .frame(height: 44)
-            .titleGlassBackground()
-            .padding(.top, 4)
-            .frame(maxWidth: .infinity, alignment: .trailing)
-            .padding(.trailing, 18)
-            .animation(.easeInOut(duration: 0.25), value: busy)
-            .allowsHitTesting(false)
+        return Button {
+            showSettings = true
+        } label: {
+            Text("Наоми")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(busy ? Color.secondary : Color.primary)
+                .modifier(ShimmerIf(active: busy, period: 1.4, minBand: 0, peak: 1.0))
+                .padding(.horizontal, 18)
+                .frame(height: 44)
+                .contentShape(Capsule())
+                .titleGlassBackground()
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 4)
+        .frame(maxWidth: .infinity)
+        .animation(.easeInOut(duration: 0.25), value: busy)
     }
 
     // Экран-заставка: чистый тёплый фон, без надписи — бесшовно продолжает
@@ -286,104 +852,310 @@ struct ChatView: View {
     private var messagesList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                // Обычный VStack (внутри BubbleColumn), не Lazy: ленивая разметка при смене
-                // высоты клавиатуры/поля промахивалась офсетом в нерассчитанную зону — чат
-                // «исчезал». Рисуется только окно windowed (старое приезжает прокруткой
-                // вверх), а сама колонка — Equatable-вид: прокрутка её НЕ пересобирает.
-                BubbleColumn(messages: windowed, loadError: loadError, lightbox: $lightbox,
-                             onRetry: { Task { await loadHistory() } })
-                    .equatable()
+                // Обычный VStack, не Lazy: ленивая разметка при смене высоты клавиатуры/поля
+                // промахивалась офсетом в нерассчитанную зону — чат «исчезал». Рисуется только
+                // окно windowed (старое приезжает прокруткой вверх), и оно разрезано надвое:
+                // застывшие ряды — Equatable-колонка (SwiftUI её пропускает, пока ряды те же),
+                // ЖИВОЙ последний ряд — отдельно. Во время стрима каждое слово мутирует только
+                // его: тик пересобирает один пузырь, а не все 60 в окне.
+                VStack(spacing: 12) {
+                    if loadError != nil || windowed.count > 1 {
+                        BubbleColumn(messages: windowed.dropLast(), loadError: loadError,
+                                     lightbox: $lightbox,
+                                     onRetry: { Task { await loadHistory() } })
+                            .equatable()
+                    }
+                    if let last = windowed.last {
+                        MessageBubble(message: last, onTapImage: { lightbox = LightboxItem(rel: $0) })
+                            .padding(.vertical, last.role == .user ? 4 : 0)   // как в колонке
+                            .id(last.id)
+                    }
+                    Color.clear
+                        .frame(height: 14)
+                        .id(chatTailID)
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
             }
-            .scrollDismissesKeyboard(.interactively)
+            // У системной клавиатуры нет публичных настройки порога, скорости или
+            // «пружины» interactive-dismiss. Системному ScrollView по-прежнему
+            // запрещено сворачивание: его жест заменяет TelegramKeyboardPanBridge.
+            .scrollDismissesKeyboard(.never)
             .bottomAnchoredStart()
-            .trackNearBottom($isNearBottom, handScrolled: $scrolledAwayByHand)
+            .trackScroll(nearBottom: $isNearBottom, handScrolled: $scrolledAwayByHand,
+                         keyboardDragging: $keyboardDragging)
+            .onChange(of: inputFocused) { _, focused in
+                // Тап в поле, пока лента пружинит у дна: системная инерция ведёт офсет
+                // к СТАРОМУ дну (посчитанному до клавиатуры) и перебивает коррекцию
+                // якоря sizeChanges — клавиатура выезжала, чат оставался. Сам факт
+                // «доехал до дна» (пружина-перелёт — тоже у дна) значит: вызвал
+                // клавиатуру — едем вместе. Мгновенный scrollTo обрывает пружину на
+                // дне ДО выезда клавиатуры, дальше обоих везёт один системный ход.
+                // Стоячий чат у дна — пустой ход; глубоко в истории — не трогаем,
+                // якорь сохранит видимое место сам.
+                guard focused, isNearBottom else { return }
+                proxy.scrollTo(chatTailID, anchor: .bottom)
+            }
             // Подтягиваем старые сообщения, когда прокрутка почти у верха окна.
             .trackNearTop { growOlder(proxy) }
             .onChange(of: messages.last?.text) {
                 // Растущий ответ мягко подталкивает ленту вверх (телепорт строки
-                // лечится именно анимацией). Если Слава ушёл листать старое — не трогаем.
-                guard isNearBottom || !scrolledAwayByHand else { return }
-                withAnimation(.easeOut(duration: 0.2)) {
-                    proxy.scrollTo(chatTailID, anchor: .bottom)
-                }
-            }
-            .onChange(of: barHeight) { oldH, newH in
-                // Поле ввода подросло (перенос строки) — двигаем ленту следом,
-                // чтобы последний пузырь не уехал под поле. Уменьшение не трогаем:
-                // при сжатии поля контент и так остаётся видимым.
-                guard oldH > 0, newH > oldH, !messages.isEmpty,
-                      isNearBottom || !scrolledAwayByHand else { return }
-                scrollTasks.barGrow?.cancel()
-                scrollTasks.barGrow = Task { @MainActor in
-                    // Кадр на то, чтобы лента узнала о новой высоте поля, иначе
-                    // прокрутка целится по старым размерам и остаётся на месте.
-                    try? await Task.sleep(for: .milliseconds(30))
-                    guard !Task.isCancelled else { return }
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(chatTailID, anchor: .bottom)
-                    }
-                    // Тихая добивка: если первый заход попал точно — пустой ход.
-                    try? await Task.sleep(for: .milliseconds(200))
-                    guard !Task.isCancelled else { return }
-                    withAnimation(.easeOut(duration: 0.1)) {
-                        proxy.scrollTo(chatTailID, anchor: .bottom)
-                    }
-                }
+                // лечится именно анимацией) — но только пока якорь цел. Свайп во время
+                // стрима срывает якорь, и лента остаётся в руке; спустился к последней
+                // строчке — якорь цепляется сам, см. trackHandAnchor.
+                guard !scrolledAwayByHand else { return }
+                nudgeTail(proxy, duration: 0.2)
             }
             .onChange(of: messages.count) { oldCount, _ in
                 guard !messages.isEmpty else { return }
                 if oldCount == 0 {
                     // Первичная загрузка истории: встаём на дно мгновенно, без «киносеанса»
                     // с прокруткой всей переписки. Тихая добивка — после ленивой разметки,
-                    // чтобы дно было точным и клавиатурный подъезд не блокировался.
+                    // чтобы дно было точным.
                     proxy.scrollTo(chatTailID, anchor: .bottom)
                     Task { @MainActor in
                         try? await Task.sleep(for: .milliseconds(350))
                         proxy.scrollTo(chatTailID, anchor: .bottom)
                     }
                 } else {
-                    // Отправка или новый ответ — единственный момент, когда чат едет вниз
-                    // из любой глубины переписки.
-                    withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo(chatTailID, anchor: .bottom)
-                    }
+                    // Новые ряды везут чат вниз, только пока якорь цел. Отправка
+                    // перевзводит якорь прямо в send() — свой ход по-прежнему стартует
+                    // вниз из любой глубины переписки. Но если рука сорвала якорь уже
+                    // ПО ХОДУ ответа (раньше «sending ||» тащил вниз безусловно), новые
+                    // слои — плашки дел, файлы — ленту не дёргают; как и чужие ряды
+                    // (автоматика, зеркало телеграма), пока Слава листает старое:
+                    // дочитает и спустится сам, новое будет ждать внизу.
+                    guard !scrolledAwayByHand else { return }
+                    nudgeTail(proxy, duration: 0.25)
                 }
             }
-            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
-                // Бар сам поднимает «дно» ленты вместе с клавиатурой — остаётся довести
-                // прокрутку до последнего сообщения. Событие приходит 2–3 раза подряд,
-                // поэтому предыдущую задачу отменяем: движение остаётся ровно одно.
-                // Если пользователь листает старую переписку (не у дна) — не трогаем:
-                // он хочет видеть найденное место, а не дно чата.
-                let kbH = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect)
-                    .map { UIScreen.main.bounds.height - $0.origin.y } ?? -1
-                // Реагируем ТОЛЬКО на подъём клавиатуры. На сворачивании пальцем клавиатура
-                // едет вниз вместе с рукой — гнать в этот момент ленту к дну значило бы
-                // драться с пальцем (то самое «поддёргивание при сворачивании»). Прошлую
-                // высоту помним в коробке (не в @State — незачем перерисовывать ленту).
-                let prevKbH = scrollTasks.lastKbH
-                scrollTasks.lastKbH = max(kbH, 0)
-                guard isNearBottom || !scrolledAwayByHand, kbH > 0, !messages.isEmpty else { return }
-                guard kbH >= prevKbH else { return }   // вниз (сворачивание) — не вмешиваемся
-                scrollTasks.keyboard?.cancel()
-                scrollTasks.keyboard = Task { @MainActor in
-                    // Первый скролл — почти сразу, чтобы ехать ПАРАЛЛЕЛЬНО с клавиатурой
-                    // (одно движение на глаз). Даже после холодного старта, когда система
-                    // не считает ленту «докрученной» и сама её не везёт.
-                    try? await Task.sleep(for: .milliseconds(60))
-                    guard !Task.isCancelled else { return }
-                    withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo(chatTailID, anchor: .bottom)
-                    }
-                    // Тихая добивка после всех анимаций: если первый скролл попал точно —
-                    // это пустой ход, если промахнулся на пиксели — мягко доводит.
-                    try? await Task.sleep(for: .milliseconds(350))
-                    guard !Task.isCancelled else { return }
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(chatTailID, anchor: .bottom)
-                    }
+        }
+    }
+
+    // Клавиатура уезжает на всю свою высоту, но панель ввода — меньше: в закрытом
+    // состоянии она должна остановиться НАД home-indicator safe area. Раньше обеим
+    // давали keyboardHeight, поэтому панель проваливалась к краю на лишние ~34 pt,
+    // ждала там didHide и затем отстреливала обратно.
+    private var inputBarTravelDistance: CGFloat {
+        max(0, keyboardHeight - deviceBottomSafeArea)
+    }
+
+    // inputChromeLayer привязан к неизменному физическому низу экрана. Открытая
+    // клавиатура задаёт полный отступ, закрытая — только home-indicator safe area.
+    // В конце dismiss обе стороны дают одинаковые 34 pt, поэтому didHide ничего
+    // визуально не перестраивает.
+    private var inputBarBottomClearance: CGFloat {
+        max(deviceBottomSafeArea, keyboardHeight - keyboardDragOffset)
+    }
+
+    // Лента уже заканчивается над container safe area, поэтому ей нужна лишь часть
+    // клавиатурного отступа сверх home indicator. Это тот же источник координат,
+    // что и у панели, а не отдельная системная keyboard safe area.
+    private var chatKeyboardClearance: CGFloat {
+        chatReserveCut ? 0 : max(0, inputBarBottomClearance - deviceBottomSafeArea)
+    }
+
+    private func beginInteractiveKeyboardDrag() {
+        // Только помечаем живой keyboard-drag. Позицию и инерцию самой ленты здесь
+        // не меняем — у последнего ответа действует тот же путь, что в истории.
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            keyboardDragging = true
+        }
+    }
+
+    private func updateInteractiveKeyboardDrag(_ offset: CGFloat) {
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            keyboardDragOffset = min(max(0, offset), inputBarTravelDistance)
+        }
+    }
+
+    private func finishInteractiveKeyboardDrag(_ finish: InteractiveKeyboardFinish,
+                                               initialVelocity: CGFloat) {
+        if finish == .dismiss {
+            // Один путь для любой позиции ленты, включая последний ответ: конечный
+            // размер применяется разом, без отдельного удержания хвоста, клампа
+            // contentOffset или принудительного scrollToBottom.
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                chatReserveCut = true
+            }
+        }
+
+        // Поле доигрывает пружину отдельно; геометрия самой ленты уже конечная и
+        // больше не вмешивается в её живую прокрутку или инерцию.
+        withAnimation(InteractiveKeyboardMotion.animation(initialVelocity: initialVelocity)) {
+            keyboardDragOffset = finish == .dismiss ? inputBarTravelDistance : 0
+        }
+    }
+
+    private func completeInteractiveKeyboardAnimation(_ finish: InteractiveKeyboardFinish) {
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            keyboardDragOffset = finish == .dismiss ? inputBarTravelDistance : 0
+            keyboardDragging = false
+        }
+    }
+
+    // Финал жеста-скрытия: клавиши в этот момент уже за низом экрана (слой увёз
+    // мост), поэтому СИСТЕМНАЯ анимация скрытия ничего не покажет — но каждый её
+    // кадр гоняет keyboard-layout по всему дереву (грабля с охоты 15.07: layout
+    // проходит даже под ignoresSafeArea) прямо поверх живой деселерации ленты —
+    // «подфризивает пару секунд». Гасим фокус с ВЫКЛЮЧЕННЫМИ анимациями UIKit:
+    // скрытие занимает один кадр — один layout-проход, деселерация течёт чистой.
+    private func resignFocusInstantly() {
+        endEditingImmediately()
+        inputFocused = false   // SwiftUI-зеркало фокуса — вслед за фактом UIKit
+    }
+
+    // sendAction(to: nil) иногда попадал не в TextField, а в responder меню выделения,
+    // если пользователь успевал снова тапнуть по полю во время финала. endEditing(true)
+    // адресует всё окно и гарантированно снимает настоящий UIKit first responder.
+    private func endEditingImmediately() {
+        let keyWindow = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)
+
+        UIView.performWithoutAnimation {
+            if keyWindow?.endEditing(true) != true {
+                UIApplication.shared.sendAction(
+                    #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil
+                )
+            }
+            keyWindow?.layoutIfNeeded()
+        }
+    }
+
+    private func recoverKeyboardFromInterruptedDismiss() {
+        // chatReserveCut живёт только между решением «закрыть» и настоящим didHide.
+        // Обычный тап по спокойно закрытому или открытому полю сюда не попадает.
+        guard chatReserveCut else { return }
+
+        // Отменяем display link старого dismiss, затем закрываем зависшую UIKit-
+        // сессию и приводим SwiftUI-зеркала к честному закрытому состоянию.
+        keyboardResetGeneration &+= 1
+        endEditingImmediately()
+
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            inputFocused = false
+            keyboardHeight = 0
+            keyboardDragOffset = 0
+            keyboardDragging = false
+            chatReserveCut = false
+        }
+
+        // didHide от принудительного resign приходит на соседнем run-loop. Даём ему
+        // закончить уборку и выдаём полю НОВЫЙ focus — теперь UIKit создаст новую
+        // клавиатурную сессию вместо уже активного responder без видимых клавиш.
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(40))
+            inputFocused = true
+        }
+    }
+
+    private func activateInputFromBubbleTap() {
+        // Если тап пришёл в узкое окно незавершённого dismiss, обычного присваивания
+        // focus недостаточно: UIKit всё ещё считает TextField первым responder.
+        if chatReserveCut {
+            recoverKeyboardFromInterruptedDismiss()
+        } else {
+            inputFocused = true
+        }
+    }
+
+    // Поспешность панели и чата при выезде клавиатуры. КРУТИТЬ ЗДЕСЬ мелкими шагами:
+    // 1.0 — ровно системная пружина клавиатуры; больше — резвее (1.1–1.3 разумный
+    // диапазон, панель начинает опережать клавиши); меньше 1.0 — ленивее.
+    private static let keyboardFollowBoost: Double = 1.40
+
+    private func updateKeyboardFrame(_ note: Notification) {
+        guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+        let height = max(0, UIScreen.main.bounds.intersection(frame).height)
+        if height > 0 {
+            UserDefaults.standard.set(Double(height), forKey: "naomi.lastKeyboardHeight")
+        }
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        let rawCurve = (note.userInfo?[UIResponder.keyboardAnimationCurveUserInfoKey] as? Int) ?? 7
+        let animation: Animation
+        switch UIView.AnimationCurve(rawValue: rawCurve) {
+        case .easeIn: animation = .easeIn(duration: duration)
+        case .easeOut: animation = .easeOut(duration: duration)
+        case .linear: animation = .linear(duration: duration)
+        default:
+            // rawCurve 7 — приватная клавиатурная кривая iOS: UIKit ведёт клавиатуру
+            // пружиной (mass 3, stiffness 1000, damping 500), а не ease-кривой.
+            // Раньше здесь стоял easeInOut той же длительности: клавиатура на старте
+            // резвее, панель и чат «догоняли» её. Та же пружина = один ход с клавишами,
+            // ускоренная в keyboardFollowBoost раз (квадрат по жёсткости, линейно по
+            // затуханию — форма кривой та же, короче только время).
+            animation = .interpolatingSpring(
+                mass: 3,
+                stiffness: 1000 * Self.keyboardFollowBoost * Self.keyboardFollowBoost,
+                damping: 500 * Self.keyboardFollowBoost
+            )
+        }
+
+        // При полном interactive-dismiss наша независимая панель уже стоит над
+        // home indicator, а резерв ленты давно отрезан (chatReserveCut). Выражения-
+        // максимумы при нулях дают те же 34/0 — визуально ничего не движется, поэтому
+        // обнуляем МГНОВЕННО: анимация здесь лишь полсекунды зря гоняла бы пересборку
+        // body поверх дотекающей инерции ленты.
+        if height == 0, keyboardDragOffset > 0 {
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                keyboardHeight = 0
+                keyboardDragOffset = 0
+            }
+            return
+        }
+
+        // Во время своего drag уведомлений обычно нет. Если iOS всё же прислала
+        // изменение (например, сменился QuickType), не перебиваем палец анимацией.
+        if keyboardDragging {
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) { keyboardHeight = height }
+        } else {
+            // Отрезанный жестом резерв возвращаем формуле ДО анимации показа:
+            // при закрытой клавиатуре формула тоже даёт 0, снятие бесшовно.
+            if chatReserveCut {
+                var transaction = Transaction()
+                transaction.animation = nil
+                withTransaction(transaction) { chatReserveCut = false }
+            }
+            withAnimation(animation) { keyboardHeight = height }
+        }
+    }
+
+    // Мягкий подъезд к дну — общий ход для нового ряда и новой строки стрима.
+    // Ждём кадр: свежий ряд/строка должны встать в разметку, мгновенный scrollTo
+    // целился по СТАРОЙ геометрии — офсет прыгал без анимации (тот самый «телепорт»
+    // при отправке и первом ответе). Клавиатура и рост поля сюда не ходят — их ведёт
+    // системный якорь sizeChanges (см. bottomAnchoredStart), синхронно с клавиатурой.
+    // Повторный зов, пока ждём кадра, схлопывается: прокрутка всё равно поедет
+    // к хвосту по самой свежей разметке на момент старта.
+    private func nudgeTail(_ proxy: ScrollViewProxy, duration: Double) {
+        guard scrollTasks.tailNudge == nil else { return }
+        scrollTasks.tailNudge = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(16))
+            // Перепроверка после кадра: за эти миллисекунды палец мог лечь на ленту
+            // и сорвать якорь — тогда не дёргаем (без неё раз в ~секунду стрима
+            // случался бы толчок из-под пальца, ровно то, что лечим).
+            if !scrolledAwayByHand {
+                withAnimation(.easeOut(duration: duration)) {
+                    proxy.scrollTo(chatTailID, anchor: .bottom)
                 }
             }
+            scrollTasks.tailNudge = nil
         }
     }
 
@@ -409,6 +1181,90 @@ struct ChatView: View {
     }
 
     // ── Поле ввода ──
+
+    private var inputChromeLayer: some View {
+        GeometryReader { geometry in
+            // SwiftUI всё равно меняет нижнюю границу предложения между 898 и
+            // 932 pt при финальном keyboard layout. Нормализуем её до физического
+            // низа экрана В ЭТОМ ЖЕ layout-проходе, без отдельного @State/event.
+            let missingToScreenBottom = max(
+                0,
+                UIScreen.main.bounds.maxY - geometry.frame(in: .global).maxY
+            )
+            let physicalClosedClearance = max(
+                0,
+                deviceBottomSafeArea - missingToScreenBottom
+            )
+            let keyboardLift = max(
+                0,
+                inputBarBottomClearance - deviceBottomSafeArea
+            )
+            // Низ затемнения всегда у физического края экрана. Его верх держим на
+            // 29 pt выше центра однострочного ряда: 8 pt нижнего padding + 21 pt
+            // половины кнопки «+» + 29 pt захода над центральной линией. Благодаря
+            // этому на самой линии центра затемнение уже существенное, а не нулевое.
+            // physicalClosedClearance + keyboardLift — фактическое расстояние от
+            // низа экрана до нижней границы inputBar в текущем кадре.
+            let inputDimmingHeight = physicalClosedClearance + keyboardLift + 58
+            // Нижнюю заливку намеренно продолжаем ещё на целую высоту экрана ЗА
+            // нижнюю границу текущего layout. Запас находится внутри overlay и не
+            // участвует в размере ZStack: иначе высокий слой тени сдвигает нижний
+            // якорь самого inputBar за экран.
+            let inputDimmingOverscan = UIScreen.main.bounds.height
+
+            ZStack(alignment: .bottom) {
+                // Прозрачная коробка задаёт слою только его видимую высоту. Сам
+                // рисунок начинается у того же верха, но свободно продолжается
+                // вниз под клавиатуру и home indicator, не двигая inputBar.
+                Color.clear
+                    .frame(height: inputDimmingHeight)
+                    .overlay(alignment: .top) {
+                        VStack(spacing: 0) {
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .clear, location: 0),
+                                    .init(color: Color.black.opacity(0.18), location: 0.12),
+                                    .init(color: Color.black.opacity(0.45), location: 0.45),
+                                    .init(color: Color.black.opacity(0.62), location: 1)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                            .frame(height: 40)
+
+                            Color.black.opacity(0.62)
+                        }
+                        .frame(
+                            width: geometry.size.width,
+                            height: inputDimmingHeight + inputDimmingOverscan,
+                            alignment: .top
+                        )
+                    }
+                    .allowsHitTesting(false)
+
+                inputBar
+                    .background {
+                        GeometryReader { barGeometry in
+                            Color.clear
+                                .preference(
+                                    key: InputBarHeightPreferenceKey.self,
+                                    value: barGeometry.size.height
+                                )
+                        }
+                    }
+                    // Постоянный padding участвует в layout только один раз. Ход над
+                    // клавиатурой — render-transform: Core Animation интерполирует
+                    // его без покадровой переразметки всех сообщений.
+                    .padding(.bottom, physicalClosedClearance)
+                    .offset(y: -keyboardLift)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        }
+        // Overlay всегда знает настоящий низ экрана. Только лента продолжает
+        // пользоваться штатной keyboard safe area для своей прокрутки.
+        .ignoresSafeArea(.container, edges: .bottom)
+        .ignoresSafeArea(.keyboard, edges: .bottom)
+    }
 
     private var inputBar: some View {
         VStack(spacing: 8) {
@@ -448,8 +1304,7 @@ struct ChatView: View {
         }
         .padding(.horizontal, 12)
         .padding(.top, 0)       // зазор «пузырь — поле» даёт хвост ленты (14 + spacing 12 = 26)
-        .padding(.bottom, 16)   // воздух между полем и клавиатурой — как в iMessage
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { barHeight = $0 }
+        .padding(.bottom, 8)    // ниже и ближе к клавиатуре/home indicator — как в Telegram
     }
 
     // Поле ввода с кнопкой отправки внутри пузыря.
@@ -461,6 +1316,19 @@ struct ChatView: View {
             .padding(.trailing, 46)   // место под кнопку внутри пузыря
             .padding(.vertical, 10)
             .inputGlassBackground()
+            // Пока поле закрыто, верхний прозрачный слой превращает ВСЮ готовую
+            // стеклянную капсулу в одну кнопку фокуса. После открытия слой исчезает,
+            // поэтому не мешает нативной установке курсора и выделению текста.
+            // Во время незавершённого dismiss он остаётся активен и запускает уже
+            // существующее восстановление зависшей UIKit-сессии.
+            .overlay {
+                if !inputFocused || chatReserveCut {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.001))
+                        .contentShape(.interaction, Rectangle())
+                        .onTapGesture { activateInputFromBubbleTap() }
+                }
+            }
             // Кнопка отправки внутри пузыря, справа. Пока отправлять нечего — её нет;
             // с первым символом или выбранным фото мягко вырастает из ничего.
             // При одной строке стоит по центру, при росте поля прижимается к низу.
@@ -768,6 +1636,14 @@ struct ChatView: View {
         pendingAtts = []
         sending = true
         leftForegroundMidSend = false   // новый ход — прошлый «свернули» не в счёт
+        // Отправка перевзводит якорь: свой ход везёт чат вниз из любой глубины
+        // переписки (guard на новые ряды теперь смотрит только на якорь, не на sending).
+        scrolledAwayByHand = false
+        // Окно ленты — обратно к базе: после чтения старой переписки оно разрастается
+        // (по +80 за подгрузку) и НЕ сжимается само, а большое окно возвращает тяжёлый
+        // покадровый пересчёт при движении клавиатуры. Отправка и так везёт чат на дно,
+        // где сжатие не видно: последние windowBase рядов — те же самые пиксели.
+        if windowCount != Self.windowBase { windowCount = Self.windowBase }
         var userMsg = ChatMessage(role: .user, text: text)
         userMsg.files = atts.map(\.name)
         messages.append(userMsg)
@@ -999,26 +1875,39 @@ private extension View {
         }
     }
 
-    // Старт ленты с низа. На iOS 18+ системный якорь ограничен ПЕРВИЧНОЙ разметкой:
-    // рост контента ведём сами анимированной прокруткой — иначе якорь дёргает ленту
-    // мгновенно, мимо анимации (тот самый телепорт строки при стриме).
+    // Дно ленты — системному якорю, двумя ролями (iOS 18+):
+    // • initialOffset — первая разметка встаёт к низу истории;
+    // • sizeChanges — при смене РАЗМЕРА вьюпорта (клавиатура выезжает/сворачивается,
+    //   поле ввода растёт строкой) офсет корректируется в том же layout-проходе и тем
+    //   же ходом, что сама клавиатура — чат едет с ней 1-в-1, синхронно. Раньше это
+    //   делал свой scrollTo по нотификации клавиатуры: своя кривая + задержка = чат
+    //   «догонял» клавиатуру, а после пружины у дна scrollTo попадал в живую инерцию
+    //   и промахивался — клавиатура выезжала, лента оставалась на месте.
+    // Якорь sizeChanges сохраняет ВИДИМУЮ точку (низ экрана остаётся тем же низом):
+    // читаешь старую переписку — клавиатура ничего не утаскивает на дно чата.
+    // Исключение — ЖИВАЯ пружина у дна в момент тапа: её инерция ведёт офсет к старому
+    // дну и перебивает коррекцию якоря; этот случай ловит onChange(inputFocused).
+    // Рост КОНТЕНТА (стрим, новые ряды) — это не размер контейнера: его по-прежнему
+    // ведёт nudgeTail анимированной прокруткой, телепорт строк якорь не возвращает.
     @ViewBuilder
     func bottomAnchoredStart() -> some View {
         if #available(iOS 18.0, *) {
-            self.defaultScrollAnchor(.bottom, for: .initialOffset)
+            self
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(.bottom, for: .sizeChanges)
         } else {
             self.defaultScrollAnchor(.bottom)
         }
     }
 
+    // Только резервирует место под независимую панель; снизу намеренно нет отдельной
+    // тени, material или scroll-edge blur — видны лишь стеклянные контролы inputBar.
     @ViewBuilder
-    func floatingInputBar<Bar: View>(@ViewBuilder _ bar: @escaping () -> Bar) -> some View {
-        if #available(iOS 26.0, *) {
-            self
-                .safeAreaBar(edge: .bottom, spacing: 0, content: bar)
-                .scrollEdgeEffectStyle(.soft, for: .bottom)
-        } else {
-            self.safeAreaInset(edge: .bottom, spacing: 0, content: bar)
+    func floatingBottomReserve(height: CGFloat) -> some View {
+        self.safeAreaInset(edge: .bottom, spacing: 0) {
+            Color.clear
+                .frame(height: height)
+                .allowsHitTesting(false)
         }
     }
 
@@ -1036,33 +1925,48 @@ private extension View {
         }
     }
 
-    // «Облачко» надписи в шапке — то же стекло, что у кнопки шторки, только
-    // капсулой и без interactive (надпись не нажимается). Фолбэк — матовый пузырь.
+    // «Облачко» надписи в шапке — стеклянная капсула, как у кнопок ниже; interactive
+    // даёт родной отклик на нажатие (облачко — кнопка настроек). Фолбэк — матовый пузырь.
     @ViewBuilder
     func titleGlassBackground() -> some View {
         if #available(iOS 26.0, *) {
-            self.glassEffect(.regular, in: Capsule())
+            self.glassEffect(.regular.interactive(), in: Capsule())
         } else {
             self.background(Color.naomiBubble, in: Capsule())
         }
     }
 
-    // Следим, у дна ли прокрутка (запас ~150 пт) и листал ли пользователь рукой.
-    // Возврат на дно (любым способом) сбрасывает «листал»; жест пальцем — взводит.
-    // На старых iOS ничего не отслеживаем — поведение просто остаётся прежним.
+    // Датчики прокрутки — общий порог «у дна» 150 пт.
+    // • nearBottom: доехал ли до дна (перелёт пружины за дно — тоже «у дна»). Нужен
+    //   тапу в поле ввода: факт «дошёл до конца» помнится, даже пока лента отскакивает.
+    // • handScrolled — якорь автопрокрутки стрима: палец (.tracking/.interacting)
+    //   срывает его МГНОВЕННО — стрим не смеет дёргать чат из-под руки; обратно якорь
+    //   цепляется, когда движение УЛЕГЛОСЬ у дна (.idle) — не раньше: перевзвод по
+    //   простому «пролетаю мимо дна» случался прямо под пальцем. Отпустил выше дна —
+    //   чат стоит, где оставил, пока сам не спустится.
+    // На старых iOS не отслеживаем: якорь вечно цел, дно вечно «рядом» — как раньше.
     @ViewBuilder
-    func trackNearBottom(_ flag: Binding<Bool>, handScrolled: Binding<Bool>) -> some View {
+    func trackScroll(nearBottom: Binding<Bool>, handScrolled: Binding<Bool>,
+                     keyboardDragging: Binding<Bool>) -> some View {
         if #available(iOS 18.0, *) {
             self
                 .onScrollGeometryChange(for: Bool.self) { geo in
                     geo.visibleRect.maxY >= geo.contentSize.height - 150
                 } action: { _, isNear in
-                    flag.wrappedValue = isNear
-                    if isNear { handScrolled.wrappedValue = false }
+                    nearBottom.wrappedValue = isNear
                 }
-                .onScrollPhaseChange { _, newPhase in
+                .onScrollPhaseChange { _, newPhase, context in
+                    // Жест окна и ScrollView начинают одновременно. Пока Telegram-
+                    // жест ведёт клавиатуру, не даём его служебным фазам сорвать
+                    // автопрокруточный якорь стрима.
+                    guard !keyboardDragging.wrappedValue else { return }
                     if newPhase == .tracking || newPhase == .interacting {
                         handScrolled.wrappedValue = true
+                    } else if newPhase == .idle {
+                        let geo = context.geometry
+                        if geo.visibleRect.maxY >= geo.contentSize.height - 150 {
+                            handScrolled.wrappedValue = false
+                        }
                     }
                 }
         } else {
@@ -1273,8 +2177,7 @@ extension View {
     // ширину, «бега» не видно, поэтому там луч уже, ярче и период короче.
     func naomiShimmer(period: Double = 2.2, minBand: CGFloat = 36, peak: Double = 0.85) -> some View {
         overlay {
-            // SwiftUI. — обязательно: TimelineView без префикса это наш экран таймлайна дома
-            SwiftUI.TimelineView(.animation) { context in
+            TimelineView(.animation) { context in
                 GeometryReader { geo in
                     let phase = (context.date.timeIntervalSinceReferenceDate / period)
                         .truncatingRemainder(dividingBy: 1)

@@ -1,13 +1,7 @@
 // Настройки: две дороги к Наоми — по дому (имя Мака в сети) и из мира (туннель).
 // Приложение выбирает дорогу само (NaomiAPI.reroute), тут только адреса и пропуск.
-// Открываются из низа шторки (RootView), а не из чата.
+// Открываются по тапу на облачко «Наоми» в шапке чата; onSave зовёт чат после «Готово».
 import SwiftUI
-
-// Сигнал «настройки сохранены»: RootView шлёт его после «Готово», чат слушает,
-// перевыбирает дорогу и перечитывает историю — адреса или пропуск могли смениться.
-extension Notification.Name {
-    static let naomiSettingsSaved = Notification.Name("naomiSettingsSaved")
-}
 
 struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss

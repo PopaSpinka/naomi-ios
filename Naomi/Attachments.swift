@@ -13,7 +13,6 @@ func isImageFile(_ rel: String) -> Bool {
 
 struct RemoteImage: View {
     let rel: String
-    var trash = false   // файл из корзины: другой маршрут и свой ключ кэша
 
     @State private var image: UIImage?
     @State private var failed = false
@@ -24,7 +23,7 @@ struct RemoteImage: View {
         cache.setObject(image, forKey: rel as NSString)
     }
 
-    private var cacheKey: NSString { ((trash ? "trash:" : "") + rel) as NSString }
+    private var cacheKey: NSString { rel as NSString }
 
     var body: some View {
         Group {
@@ -50,7 +49,7 @@ struct RemoteImage: View {
                 return
             }
             do {
-                let img = try await NaomiAPI.loadImage(rel: rel, maxPixel: 700, trash: trash)
+                let img = try await NaomiAPI.loadImage(rel: rel, maxPixel: 700)
                 Self.cache.setObject(img, forKey: cacheKey)
                 image = img
             } catch {
@@ -106,7 +105,6 @@ struct LightboxItem: Identifiable {
 
 struct LightboxView: View {
     let rel: String
-    var trash = false   // фото из корзины — тянем через маршрут корзины
     @Environment(\.dismiss) private var dismiss
     @State private var image: UIImage?
     @State private var failed = false
@@ -144,7 +142,7 @@ struct LightboxView: View {
         }
         .task {
             // Полный размер под экран телефона; миниатюрный кэш не трогаем.
-            do { image = try await NaomiAPI.loadImage(rel: rel, maxPixel: 2400, trash: trash) }
+            do { image = try await NaomiAPI.loadImage(rel: rel, maxPixel: 2400) }
             catch { failed = true }
         }
     }
