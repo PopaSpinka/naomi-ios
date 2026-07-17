@@ -5,6 +5,7 @@ import SwiftUI
 
 struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.naomiTheme) private var theme
     @AppStorage("serverLocal") private var serverLocal = NaomiAPI.defaultLocal
     @AppStorage("serverTunnel") private var serverTunnel = ""
     @AppStorage("apiToken") private var apiToken = ""
@@ -49,7 +50,7 @@ struct SettingsSheet: View {
                     Button("Вернуть домашний адрес") {
                         serverLocal = NaomiAPI.defaultLocal
                     }
-                    .tint(.naomiAccent)
+                    .tint(theme.accent)
                 }
             }
             .navigationTitle("Настройки")
@@ -60,7 +61,7 @@ struct SettingsSheet: View {
                         dismiss()
                         onSave()
                     }
-                    .tint(.naomiAccent)
+                    .tint(theme.accent)
                 }
             }
         }

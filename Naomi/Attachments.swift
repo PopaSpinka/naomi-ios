@@ -12,6 +12,7 @@ func isImageFile(_ rel: String) -> Bool {
 // ── Миниатюра со склада ──
 
 struct RemoteImage: View {
+    @Environment(\.naomiTheme) private var theme
     let rel: String
 
     @State private var image: UIImage?
@@ -33,10 +34,10 @@ struct RemoteImage: View {
                     .scaledToFill()
             } else {
                 ZStack {
-                    Color.naomiBubble
+                    theme.userBubble
                     if failed {
                         Image(systemName: "photo")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(theme.secondaryText)
                     } else {
                         ProgressView()
                     }
@@ -62,6 +63,7 @@ struct RemoteImage: View {
 // ── Ряд вложений одного сообщения ──
 
 struct MsgAttachments: View {
+    @Environment(\.naomiTheme) private var theme
     let files: [String]
     var onTapImage: (String) -> Void = { _ in }
 
@@ -84,10 +86,10 @@ struct MsgAttachments: View {
                             .lineLimit(1)
                     }
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryText)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
-                    .background(Color.naomiBubble.opacity(0.55), in: Capsule())
+                    .background(theme.attachmentChip, in: Capsule())
                 }
             }
         }

@@ -1,23 +1,63 @@
-// Палитра — один в один с вебом (frontend/styles.css): тёплая «бумага» + терракотовый акцент.
+// Все цвета и их прозрачность редактируются штатно в Assets.xcassets.
+// Выбери нужный Color Set, затем светлый/тёмный образец и открой цветной квадрат
+// в Attributes inspector. Canvas подхватывает сохранённое значение автоматически.
 import SwiftUI
 
-extension Color {
-    /// Цвет с раздельными значениями для светлой и тёмной темы.
-    init(light: UInt32, dark: UInt32) {
-        self.init(uiColor: UIColor { trait in
-            let hex = trait.userInterfaceStyle == .dark ? dark : light
-            return UIColor(
-                red: CGFloat((hex >> 16) & 0xff) / 255,
-                green: CGFloat((hex >> 8) & 0xff) / 255,
-                blue: CGFloat(hex & 0xff) / 255,
-                alpha: 1
-            )
-        })
-    }
+struct NaomiTheme {
+    // Основные поверхности и текст.
+    var background: Color
+    var userBubble: Color
+    var accent: Color
+    var primaryText: Color
+    var secondaryText: Color
+    var warning: Color
 
-    static let naomiBg = Color(light: 0xFAF9F6, dark: 0x16150F)
-    static let naomiBubble = Color(light: 0xEFEAE0, dark: 0x2A281F)
-    static let naomiAccent = Color(light: 0xC96442, dark: 0xE08562)
+    // Тонировка системного Liquid Glass. Alpha 0 = чистое системное стекло.
+    var inputGlassTint: Color
+    var buttonGlassTint: Color
+    var titleGlassTint: Color
+
+    // Три самостоятельных Color Set уже содержат нужную прозрачность градиента.
+    var inputDimmingStart: Color
+    var inputDimmingMiddle: Color
+    var inputDimmingEnd: Color
+
+    // Цвет + alpha заметных состояний также целиком живут в Assets.
+    var completedActionText: Color
+    var errorText: Color
+    var attachmentChip: Color
+    var uploadingAttachmentOverlay: Color
+
+    // Здесь только связи «элемент интерфейса → именованный Color Set».
+    static let standard = NaomiTheme(
+        background: Color("ChatBackground"),
+        userBubble: Color("UserBubble"),
+        accent: Color("AccentColor"),
+        primaryText: Color("PrimaryText"),
+        secondaryText: Color("SecondaryText"),
+        warning: Color("Warning"),
+        inputGlassTint: Color("InputGlassTint"),
+        buttonGlassTint: Color("ButtonGlassTint"),
+        titleGlassTint: Color("TitleGlassTint"),
+        inputDimmingStart: Color("InputDimmingStart"),
+        inputDimmingMiddle: Color("InputDimmingMiddle"),
+        inputDimmingEnd: Color("InputDimmingEnd"),
+        completedActionText: Color("CompletedActionText"),
+        errorText: Color("ErrorText"),
+        attachmentChip: Color("AttachmentChip"),
+        uploadingAttachmentOverlay: Color("UploadingAttachmentOverlay")
+    )
+}
+
+private struct NaomiThemeEnvironmentKey: EnvironmentKey {
+    static let defaultValue = NaomiTheme.standard
+}
+
+extension EnvironmentValues {
+    var naomiTheme: NaomiTheme {
+        get { self[NaomiThemeEnvironmentKey.self] }
+        set { self[NaomiThemeEnvironmentKey.self] = newValue }
+    }
 }
 
 // Шрифты чата (15.07) — КРУТИТЬ ЗДЕСЬ. Пропорции сняты с веба, где размеры подобраны

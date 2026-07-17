@@ -132,9 +132,13 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
     let inputFocused: Bool
     let keyboardHeight: CGFloat
     let resetGeneration: Int
+    // «Лента у самого дна?» — спрашиваем в момент КАСАНИЯ (touchesBegan), пока палец
+    // ещё ничего не утащил: к концу жеста прокрутка уже уехала, и по ней не понять,
+    // был ли это «закрой клавиатуру от последнего ответа» или листание истории.
+    let chatAtBottom: () -> Bool
     let onBegin: () -> Void
     let onOffset: (CGFloat) -> Void
-    let onFinish: (InteractiveKeyboardFinish, CGFloat) -> Void
+    let onFinish: (InteractiveKeyboardFinish, CGFloat, Bool) -> Void
     let onAnimationComplete: (InteractiveKeyboardFinish) -> Void
     let onRequestDismiss: () -> Void
 
@@ -176,9 +180,11 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
 
         private var inputFocused = false
         private var keyboardHeight: CGFloat = 0
+        private var chatAtBottom: () -> Bool = { false }
+        private var startedAtBottom = false
         private var onBegin: () -> Void = {}
         private var onOffset: (CGFloat) -> Void = { _ in }
-        private var onFinish: (InteractiveKeyboardFinish, CGFloat) -> Void = { _, _ in }
+        private var onFinish: (InteractiveKeyboardFinish, CGFloat, Bool) -> Void = { _, _, _ in }
         private var onAnimationComplete: (InteractiveKeyboardFinish) -> Void = { _ in }
         private var onRequestDismiss: () -> Void = {}
 
@@ -200,6 +206,7 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
         func update(from bridge: TelegramKeyboardPanBridge) {
             inputFocused = bridge.inputFocused
             keyboardHeight = bridge.keyboardHeight
+            chatAtBottom = bridge.chatAtBottom
             onBegin = bridge.onBegin
             onOffset = bridge.onOffset
             onFinish = bridge.onFinish
@@ -273,6 +280,8 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
             keyboardTop = frame.minY
             activeKeyboardHeight = height
             moved = false
+            // Снимок «у дна» — ровно в момент касания, до первого сдвига пальца.
+            startedAtBottom = chatAtBottom()
         }
 
         private func moveTracking(to point: CGPoint) {
@@ -318,7 +327,7 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
                 initialVelocity: verticalVelocity
             )
             let finish: InteractiveKeyboardFinish = shouldDismiss ? .dismiss : .restore
-            onFinish(finish, verticalVelocity)
+            onFinish(finish, verticalVelocity, startedAtBottom)
             followKeyboardAnimation(
                 finish: finish,
                 duration: animationDuration
@@ -505,6 +514,185 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
     }
 }
 
+// Возврат ленты к дну после жеста-скрытия клавиатуры, начатого у дна. Такой свайп —
+// это ещё и обычный pan ленты: палец успевает утащить чат в историю, а инерция после
+// отпускания везёт дальше — последний ответ уезжает под облачко ввода. Если жест
+// НАЧАЛСЯ у дна, финал должен быть тем же дном: инерцию глушим и ведём офсет к нижней
+// границе той же физикой, что финал клавиатуры (жёсткость семьи 240, демпфер
+// критический — приезд без отскока, никаких видимых пружин). Цель пересчитывается
+// КАЖДЫЙ кадр по живой геометрии: параллельно режется резерв ленты (chatReserveCut),
+// стрим может дописывать строки — а якорь sizeChanges сдвигает офсет и цель на одну
+// и ту же величину, так что пружина этих перестроек даже не чувствует. Рука главнее:
+// новое касание ленты (isTracking) или фокус поля — и возврат молча отменяется.
+private final class ChatScrollPinBox: NSObject {
+    // Живое расстояние видимого низа до конца контента — зеркалится каждым кадром
+    // прокрутки (см. trackBottomDistance) в поле класса, мимо @State: перерисовок
+    // не дёргает. Стартовое «бесконечно далеко» = на iOS без датчика (<18) возврат
+    // просто никогда не включается.
+    var distanceToBottom: CGFloat = .greatestFiniteMagnitude
+    weak var scrollView: UIScrollView?
+
+    private var displayLink: CADisplayLink?
+    private var velocity: CGFloat = 0
+    private var lastTick: CFTimeInterval = 0
+    private var onSettled: (() -> Void)?
+
+    private let stiffness: CGFloat = 240   // семья InteractiveKeyboardMotion
+    private let damping: CGFloat = 31      // ≈ 2·√240 — критическое, без перелёта
+
+    // fingerVelocity — настоящая скорость пальца (pt/s, вниз положительная). Палец
+    // вёл контент вниз — офсет летел в минус: отдаём пружине ту же скорость, чтобы
+    // остановка была продолжением движения (чуть донесёт и мягко вернёт), а не ступенькой.
+    func pin(fingerVelocity: CGFloat, onSettled: @escaping () -> Void) {
+        guard scrollView != nil else { return }
+        cancel()
+        self.onSettled = onSettled
+        velocity = -min(max(fingerVelocity, -3000), 3000)
+        stopDeceleration()
+        lastTick = CACurrentMediaTime()
+        let link = CADisplayLink(target: self, selector: #selector(step))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    func cancel() {
+        displayLink?.invalidate()
+        displayLink = nil
+        onSettled = nil
+    }
+
+    // Классический публичный способ заглушить инерцию: «остановись на текущем месте».
+    private func stopDeceleration() {
+        guard let scrollView, scrollView.isDecelerating else { return }
+        scrollView.setContentOffset(scrollView.contentOffset, animated: false)
+    }
+
+    @objc private func step(_ link: CADisplayLink) {
+        guard let scrollView, !scrollView.isTracking else {
+            cancel()   // лента исчезла или её снова взяли рукой — палец главнее
+            return
+        }
+        // Порядок окончания жестов окна и ленты не гарантирован: системная инерция
+        // могла стартовать уже ПОСЛЕ pin — глушим её, как только замечаем.
+        stopDeceleration()
+
+        let now = CACurrentMediaTime()
+        let dt = CGFloat(min(now - lastTick, 1.0 / 30))   // крышка на случай подвиса кадров
+        lastTick = now
+
+        let inset = scrollView.adjustedContentInset
+        let minOffset = -inset.top
+        let target = max(
+            minOffset,
+            scrollView.contentSize.height + inset.bottom - scrollView.bounds.height
+        )
+        // Отклонение пересчитываем от ЖИВОГО офсета: чужие сдвиги (якорь sizeChanges
+        // при срезе резерва) не копятся в ошибку, пружина продолжает от факта.
+        var x = scrollView.contentOffset.y - target
+        let acceleration = -stiffness * x - damping * velocity
+        velocity += acceleration * dt
+        x += velocity * dt
+
+        if abs(x) < 0.5, abs(velocity) < 12 {
+            scrollView.contentOffset.y = target
+            let done = onSettled
+            cancel()
+            done?()
+            return
+        }
+        // Кламп сверху: за дно (под облачко ввода) не заезжаем ни на кадр.
+        scrollView.contentOffset.y = min(max(target + x, minOffset), target)
+    }
+}
+
+// «У самого дна» для возврата после жеста-скрытия: строже общего порога 150 —
+// прижатие не должно красть позицию, когда Слава чуть отлистал и читает хвост
+// длинного ответа. 40 пт покрывает дрожь дна (недоехавший nudge, доли строки).
+private let chatBottomPinThreshold: CGFloat = 40
+
+// У системной bounce-пружины UIScrollView нет публичной настройки длительности.
+// Этот probe живёт ВНУТРИ контента именно чатовой ленты и настраивает ближайший
+// UIScrollView публичным способом: bounce оставляем, но скорость гасим примерно
+// вдвое сильнее (.996 против системных .998). До границы доезжает меньше энергии —
+// перелёт получается короче и слабее, возврат заканчивается заметно быстрее.
+private struct ChatScrollPhysicsConfigurator: UIViewRepresentable {
+    let pinBox: ChatScrollPinBox
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        view.pinBox = pinBox
+        return view
+    }
+
+    func updateUIView(_ uiView: ProbeView, context: Context) {
+        uiView.pinBox = pinBox
+        uiView.configureNearestScrollView()
+    }
+
+    static func dismantleUIView(_ uiView: ProbeView, coordinator: Void) {
+        uiView.restoreConfiguredScrollView()
+    }
+
+    final class ProbeView: UIView {
+        var pinBox: ChatScrollPinBox?
+        private weak var configuredScrollView: UIScrollView?
+        private var originalBounces: Bool?
+        private var originalDecelerationRate: UIScrollView.DecelerationRate?
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            configureNearestScrollView()
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            configureNearestScrollView()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            configureNearestScrollView()
+        }
+
+        func configureNearestScrollView() {
+            var ancestor = superview
+            while let current = ancestor, !(current is UIScrollView) {
+                ancestor = current.superview
+            }
+            guard let scrollView = ancestor as? UIScrollView else { return }
+            // Той же находкой пользуется возврат к дну: коробке нужен настоящий
+            // UIScrollView, чтобы глушить инерцию и вести офсет.
+            pinBox?.scrollView = scrollView
+
+            if configuredScrollView !== scrollView {
+                restoreConfiguredScrollView()
+                configuredScrollView = scrollView
+                originalBounces = scrollView.bounces
+                originalDecelerationRate = scrollView.decelerationRate
+            }
+
+            // SwiftUI может повторно применить свои настройки при обновлении дерева,
+            // поэтому подтверждаем значения и в update/layout, а не только один раз.
+            scrollView.bounces = true
+            scrollView.decelerationRate = .init(rawValue: 0.996)
+        }
+
+        func restoreConfiguredScrollView() {
+            if let scrollView = configuredScrollView {
+                if let originalBounces { scrollView.bounces = originalBounces }
+                if let originalDecelerationRate {
+                    scrollView.decelerationRate = originalDecelerationRate
+                }
+            }
+            configuredScrollView = nil
+            originalBounces = nil
+            originalDecelerationRate = nil
+        }
+    }
+}
+
 // Хвост ленты (маркер-«дно») — общий id для колонки пузырей и обработчиков прокрутки.
 private let chatTailID = "chat-tail"
 
@@ -528,6 +716,7 @@ private struct InputBarHeightPreferenceKey: PreferenceKey {
 // Биндинг lightbox и замыкание onRetry в сравнении не участвуют (их и не с чем сверять),
 // но пишут в стабильное хранилище — работают даже когда вид пропущен.
 private struct BubbleColumn: View, Equatable {
+    @Environment(\.naomiTheme) private var theme
     let messages: ArraySlice<ChatMessage>
     let loadError: String?
     @Binding var lightbox: LightboxItem?
@@ -557,10 +746,10 @@ private struct BubbleColumn: View, Equatable {
             Text(text)
                 .font(.subheadline)
                 .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondaryText)
             Button("Попробовать ещё раз", action: onRetry)
                 .font(.subheadline.weight(.medium))
-                .tint(.naomiAccent)
+                .tint(theme.accent)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
@@ -588,6 +777,8 @@ private enum MarkdownCache {
 }
 
 struct ChatView: View {
+    @Environment(\.naomiTheme) private var theme
+    private let previewMode: Bool
     // Фаза сцены: возврат из фона — повод тихо перечитать историю (Мак мог дописать
     // ответ или прислать автоматику/напоминалку, пока телефон спал). См. .onChange ниже.
     @Environment(\.scenePhase) private var scenePhase
@@ -617,6 +808,10 @@ struct ChatView: View {
     // а НЕ в @State: переустановка задачи не должна перерисовывать экран. Раньше они
     // жили в @State — и каждая переустановка дёргала пересборку всей ленты.
     @State private var scrollTasks = ScrollTaskBox()
+    // Возврат ленты к дну после жеста-скрытия клавиатуры, начатого у дна: коробка
+    // глушит инерцию и пружиной сажает последний ответ над облачком ввода
+    // (см. ChatScrollPinBox). Ссылка стабильна, её поля меняются без перерисовок.
+    @State private var scrollPin = ChatScrollPinBox()
     // «Якорь сорван»: пользователь взял ленту рукой. Палец срывает якорь МГНОВЕННО —
     // автопрокрутка стрима не смеет дёргать чат из-под пальца; обратно якорь цепляется,
     // когда жест улёгся у дна (см. trackScroll), или отправкой сообщения (send()).
@@ -626,6 +821,11 @@ struct ChatView: View {
     // даже пока лента отскакивает, и клавиатура поднимает чат с собой (см. onChange
     // inputFocused). Глубоко в истории остаётся false — там ничего не дёргаем.
     @State private var isNearBottom = true
+    // Фокус во время нижнего bounce нельзя запускать параллельно с его пружиной:
+    // UIScrollView ещё ведёт contentOffset к старому дну, а клавиатура уже меняет
+    // viewport. Тап не теряем — ставим в очередь до настоящей системной фазы .idle.
+    @State private var chatScrollIsIdle = true
+    @State private var pendingBottomInputFocus = false
     // Свой интерактивный жест клавиатуры (как у Telegram). Высоту берём из системных
     // нотификаций, а offset рисуем сами — при таком drag iOS не меняет safe area.
     @State private var keyboardHeight: CGFloat = 0
@@ -655,11 +855,51 @@ struct ChatView: View {
     // проседало: на экране нужны 1–2 экрана переписки, а не вся история сразу.
     @State private var windowCount = ChatView.windowBase
 
+    init(previewMode: Bool = false) {
+        self.previewMode = previewMode
+        guard previewMode else { return }
+        _messages = State(initialValue: Self.previewConversation)
+        _showSplash = State(initialValue: false)
+    }
+
+    private static var previewConversation: [ChatMessage] {
+        var completed = ChatMessage(
+            role: .assistant,
+            text: "проверила палитру и собираю экран",
+            kind: .action
+        )
+        completed.isLive = false
+
+        var active = ChatMessage(
+            role: .assistant,
+            text: "подбираю оттенки интерфейса",
+            kind: .action
+        )
+        active.isLive = true
+
+        return [
+            ChatMessage(
+                role: .assistant,
+                text: "Привет! Здесь можно вживую настроить каждый основной цвет чата."
+            ),
+            ChatMessage(
+                role: .user,
+                text: "Хочу тёплый фон, спокойный пузырь и более выразительное стекло."
+            ),
+            completed,
+            active,
+            ChatMessage(
+                role: .assistant,
+                text: "Меняй параметры справа — результат сразу появится на этом экране."
+            )
+        ]
+    }
+
     var body: some View {
         ZStack {
             // Фон остаётся неподвижным, пока весь нижний chat-surface едет за
             // клавиатурой: иначе сверху на пружине открывался бы пустой участок.
-            Color.naomiBg.ignoresSafeArea()
+            theme.background.ignoresSafeArea()
 
             ZStack {
                 messagesList
@@ -695,17 +935,20 @@ struct ChatView: View {
         // Recognizer висит на окне приложения: жест не обрывается, когда палец из
         // ленты заезжает на системную клавиатуру. Сам мост прозрачен для обычных тапов.
         .overlay {
-            TelegramKeyboardPanBridge(
-                inputFocused: inputFocused,
-                keyboardHeight: keyboardHeight,
-                resetGeneration: keyboardResetGeneration,
-                onBegin: beginInteractiveKeyboardDrag,
-                onOffset: updateInteractiveKeyboardDrag,
-                onFinish: finishInteractiveKeyboardDrag,
-                onAnimationComplete: completeInteractiveKeyboardAnimation,
-                onRequestDismiss: { resignFocusInstantly() }
-            )
-            .allowsHitTesting(false)
+            if !previewMode {
+                TelegramKeyboardPanBridge(
+                    inputFocused: inputFocused,
+                    keyboardHeight: keyboardHeight,
+                    resetGeneration: keyboardResetGeneration,
+                    chatAtBottom: { scrollPin.distanceToBottom < chatBottomPinThreshold },
+                    onBegin: beginInteractiveKeyboardDrag,
+                    onOffset: updateInteractiveKeyboardDrag,
+                    onFinish: finishInteractiveKeyboardDrag,
+                    onAnimationComplete: completeInteractiveKeyboardAnimation,
+                    onRequestDismiss: { resignFocusInstantly() }
+                )
+                .allowsHitTesting(false)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) {
             updateKeyboardFrame($0)
@@ -728,6 +971,7 @@ struct ChatView: View {
             keyboardResetGeneration &+= 1
         }
         .task {
+            guard !previewMode else { return }
             // «Визитку» держит только системный launch screen. Наша копия заставки
             // лишь бесшовно перехватывает его на первом кадре и сразу тает,
             // одновременно выезжает клавиатура. Микро-пауза — на первую разметку
@@ -810,7 +1054,7 @@ struct ChatView: View {
         } label: {
             Text("Наоми")
                 .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(busy ? Color.secondary : Color.primary)
+                .foregroundStyle(busy ? theme.secondaryText : theme.primaryText)
                 .modifier(ShimmerIf(active: busy, period: 1.4, minBand: 0, peak: 1.0))
                 .padding(.horizontal, 18)
                 .frame(height: 44)
@@ -826,7 +1070,7 @@ struct ChatView: View {
     // Экран-заставка: чистый тёплый фон, без надписи — бесшовно продолжает
     // системный launch screen (он такого же цвета) и тает над готовым интерфейсом.
     private var splash: some View {
-        Color.naomiBg
+        theme.background
             .ignoresSafeArea()
             .transition(.opacity)
     }
@@ -876,6 +1120,11 @@ struct ChatView: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 12)
+                .background {
+                    ChatScrollPhysicsConfigurator(pinBox: scrollPin)
+                        .frame(width: 0, height: 0)
+                        .allowsHitTesting(false)
+                }
             }
             // У системной клавиатуры нет публичных настройки порога, скорости или
             // «пружины» interactive-dismiss. Системному ScrollView по-прежнему
@@ -883,8 +1132,37 @@ struct ChatView: View {
             .scrollDismissesKeyboard(.never)
             .bottomAnchoredStart()
             .trackScroll(nearBottom: $isNearBottom, handScrolled: $scrolledAwayByHand,
-                         keyboardDragging: $keyboardDragging)
+                         keyboardDragging: $keyboardDragging, isIdle: $chatScrollIsIdle)
+            .trackBottomDistance(into: scrollPin)
+            .onChange(of: chatScrollIsIdle) { _, isIdle in
+                guard isIdle, pendingBottomInputFocus else { return }
+                pendingBottomInputFocus = false
+
+                // Если отскок действительно закончился у хвоста, сначала одним
+                // неанимированным кадром фиксируем его точное дно. Если за время
+                // ожидания пользователь увёл ленту выше — его позицию не трогаем.
+                if isNearBottom {
+                    var transaction = Transaction()
+                    transaction.animation = nil
+                    withTransaction(transaction) {
+                        proxy.scrollTo(chatTailID, anchor: .bottom)
+                    }
+                }
+
+                // FocusState меняет резерв ленты и запускает клавиатуру. Отдаём ему
+                // следующий кадр, чтобы он не попал в ту же транзакцию, где погасла
+                // пружина и зафиксировался contentOffset.
+                Task { @MainActor in
+                    await Task.yield()
+                    inputFocused = true
+                }
+            }
             .onChange(of: inputFocused) { _, focused in
+                guard focused else { return }
+                // Фокус поля — рука главнее возврата к дну после жеста-скрытия: если
+                // пружина ChatScrollPinBox ещё едет, офсет дальше ведут клавиатура и
+                // системный якорь, двум водителям тут не место.
+                scrollPin.cancel()
                 // Тап в поле, пока лента пружинит у дна: системная инерция ведёт офсет
                 // к СТАРОМУ дну (посчитанному до клавиатуры) и перебивает коррекцию
                 // якоря sizeChanges — клавиатура выезжала, чат оставался. Сам факт
@@ -893,7 +1171,7 @@ struct ChatView: View {
                 // дне ДО выезда клавиатуры, дальше обоих везёт один системный ход.
                 // Стоячий чат у дна — пустой ход; глубоко в истории — не трогаем,
                 // якорь сохранит видимое место сам.
-                guard focused, isNearBottom else { return }
+                guard isNearBottom else { return }
                 proxy.scrollTo(chatTailID, anchor: .bottom)
             }
             // Подтягиваем старые сообщения, когда прокрутка почти у верха окна.
@@ -974,7 +1252,8 @@ struct ChatView: View {
     }
 
     private func finishInteractiveKeyboardDrag(_ finish: InteractiveKeyboardFinish,
-                                               initialVelocity: CGFloat) {
+                                               initialVelocity: CGFloat,
+                                               startedAtBottom: Bool) {
         if finish == .dismiss {
             // Один путь для любой позиции ленты, включая последний ответ: конечный
             // размер применяется разом, без отдельного удержания хвоста, клампа
@@ -990,6 +1269,18 @@ struct ChatView: View {
         // больше не вмешивается в её живую прокрутку или инерцию.
         withAnimation(InteractiveKeyboardMotion.animation(initialVelocity: initialVelocity)) {
             keyboardDragOffset = finish == .dismiss ? inputBarTravelDistance : 0
+        }
+
+        // Жест начался у самого дна и кончился скрытием: это был «закрой клавиатуру»,
+        // а не «листай историю» — но pan ленты и инерция уже утащили чат от дна.
+        // Возврат ведёт ChatScrollPinBox: глушит инерцию и той же пружинной семьёй
+        // сажает последний ответ над облачком ввода. Мост отдаёт скорость пальца
+        // приглушённой в 5 раз (формула Telegram) — возвращаем настоящие pt/s.
+        // Из глубины истории (startedAtBottom == false) не трогаем ничего.
+        if finish == .dismiss, startedAtBottom {
+            scrollPin.pin(fingerVelocity: initialVelocity * 5) {
+                scrolledAwayByHand = false   // финал у дна — якорь автопрокрутки снова цел
+            }
         }
     }
 
@@ -1066,15 +1357,19 @@ struct ChatView: View {
         // focus недостаточно: UIKit всё ещё считает TextField первым responder.
         if chatReserveCut {
             recoverKeyboardFromInterruptedDismiss()
+        } else if isNearBottom, !chatScrollIsIdle {
+            // В нижнем bounce не сталкиваем две пружины. Системный scroll phase сам
+            // даст точный момент продолжения — без подобранной на глаз задержки.
+            pendingBottomInputFocus = true
         } else {
             inputFocused = true
         }
     }
 
     // Поспешность панели и чата при выезде клавиатуры. КРУТИТЬ ЗДЕСЬ мелкими шагами:
-    // 1.0 — ровно системная пружина клавиатуры; больше — резвее (1.1–1.3 разумный
-    // диапазон, панель начинает опережать клавиши); меньше 1.0 — ленивее.
-    private static let keyboardFollowBoost: Double = 1.40
+    // 1.0 — системная длительность; больше — короче и резвее (1.1–1.3 разумный
+    // диапазон), меньше 1.0 — ленивее. Форма ниже монотонная, без перелёта/отскока.
+    private static let keyboardFollowBoost: Double = 1.3
 
     private func updateKeyboardFrame(_ note: Notification) {
         guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
@@ -1083,23 +1378,22 @@ struct ChatView: View {
             UserDefaults.standard.set(Double(height), forKey: "naomi.lastKeyboardHeight")
         }
         let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
-        let rawCurve = (note.userInfo?[UIResponder.keyboardAnimationCurveUserInfoKey] as? Int) ?? 7
+        let rawCurve = (note.userInfo?[UIResponder.keyboardAnimationCurveUserInfoKey] as? Int) ?? 3
         let animation: Animation
         switch UIView.AnimationCurve(rawValue: rawCurve) {
         case .easeIn: animation = .easeIn(duration: duration)
         case .easeOut: animation = .easeOut(duration: duration)
         case .linear: animation = .linear(duration: duration)
         default:
-            // rawCurve 7 — приватная клавиатурная кривая iOS: UIKit ведёт клавиатуру
-            // пружиной (mass 3, stiffness 1000, damping 500), а не ease-кривой.
-            // Раньше здесь стоял easeInOut той же длительности: клавиатура на старте
-            // резвее, панель и чат «догоняли» её. Та же пружина = один ход с клавишами,
-            // ускоренная в keyboardFollowBoost раз (квадрат по жёсткости, линейно по
-            // затуханию — форма кривой та же, короче только время).
-            animation = .interpolatingSpring(
-                mass: 3,
-                stiffness: 1000 * Self.keyboardFollowBoost * Self.keyboardFollowBoost,
-                damping: 500 * Self.keyboardFollowBoost
+            // rawCurve 7 — специальная системная кривая клавиатуры, которую SwiftUI
+            // напрямую не принимает. Пружинная аппроксимация давала панели и ленте
+            // лишний хвост после того, как клавиши уже остановились. Монотонная cubic
+            // быстро подхватывает клавиатуру и мягко приходит РОВНО в 1.0: контрольные
+            // точки не выходят за диапазон, поэтому перелёт математически невозможен.
+            // Boost теперь меняет только время, а не физику финала.
+            animation = .timingCurve(
+                0.15, 0.55, 0.25, 1.0,
+                duration: max(0.01, duration / Self.keyboardFollowBoost)
             )
         }
 
@@ -1223,16 +1517,16 @@ struct ChatView: View {
                             LinearGradient(
                                 stops: [
                                     .init(color: .clear, location: 0),
-                                    .init(color: Color.black.opacity(0.18), location: 0.12),
-                                    .init(color: Color.black.opacity(0.45), location: 0.45),
-                                    .init(color: Color.black.opacity(0.62), location: 1)
+                                    .init(color: theme.inputDimmingStart, location: 0.12),
+                                    .init(color: theme.inputDimmingMiddle, location: 0.45),
+                                    .init(color: theme.inputDimmingEnd, location: 1)
                                 ],
                                 startPoint: .top,
                                 endPoint: .bottom
                             )
                             .frame(height: 40)
 
-                            Color.black.opacity(0.62)
+                            theme.inputDimmingEnd
                         }
                         .frame(
                             width: geometry.size.width,
@@ -1287,7 +1581,7 @@ struct ChatView: View {
                 PhotosPicker(selection: $pickedItems, maxSelectionCount: 4, matching: .images) {
                     Image(systemName: "plus")
                         .font(.body.weight(.bold))
-                        .foregroundStyle(Color.primary)
+                        .foregroundStyle(theme.primaryText)
                         .frame(width: 42, height: 42)
                         .sendGlassBackground()
                 }
@@ -1324,7 +1618,7 @@ struct ChatView: View {
             .overlay {
                 if !inputFocused || chatReserveCut {
                     Rectangle()
-                        .fill(Color.primary.opacity(0.001))
+                        .fill(theme.primaryText.opacity(0.001))
                         .contentShape(.interaction, Rectangle())
                         .onTapGesture { activateInputFromBubbleTap() }
                 }
@@ -1352,16 +1646,18 @@ struct ChatView: View {
                 if let t = att.thumb {
                     Image(uiImage: t).resizable().scaledToFill()
                 } else {
-                    Color.naomiBubble
+                    theme.userBubble
                 }
             }
             .frame(width: 64, height: 64)
             .clipShape(RoundedRectangle(cornerRadius: 12))
-            .opacity(att.uploaded == nil ? 0.55 : 1)
             .overlay {
+                if att.uploaded == nil {
+                    theme.uploadingAttachmentOverlay
+                }
                 if att.failed {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.yellow)
+                        .foregroundStyle(theme.warning)
                 } else if att.uploaded == nil {
                     ProgressView()
                 }
@@ -1415,7 +1711,7 @@ struct ChatView: View {
         Button(action: send) {
             Image(systemName: "arrow.up")
                 .font(font.weight(.bold))
-                .foregroundStyle(canSend ? Color.primary : Color.secondary)
+                .foregroundStyle(canSend ? theme.primaryText : theme.secondaryText)
                 .frame(width: size, height: size)
                 .sendGlassBackground()
         }
@@ -1639,6 +1935,7 @@ struct ChatView: View {
         // Отправка перевзводит якорь: свой ход везёт чат вниз из любой глубины
         // переписки (guard на новые ряды теперь смотрит только на якорь, не на sending).
         scrolledAwayByHand = false
+        scrollPin.cancel()   // отправка сама везёт к дну — возврат-пружине тут делать нечего
         // Окно ленты — обратно к базе: после чтения старой переписки оно разрастается
         // (по +80 за подгрузку) и НЕ сжимается само, а большое окно возвращает тяжёлый
         // покадровый пересчёт при движении клавиатуры. Отправка и так везёт чат на дно,
@@ -1851,28 +2148,66 @@ private func nextWordEnd(_ chars: [Character], from: Int, limit: Int) -> Int {
 // Поле ввода как системный нижний бар (iOS 26): safeAreaBar даёт под ним родное
 // прогрессивное размытие края — ровно то же, что система рисует под шапкой.
 // На старых iOS — обычная вставка без эффекта.
+private struct InputGlassBackgroundModifier: ViewModifier {
+    @Environment(\.naomiTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.glassEffect(
+                .regular.tint(theme.inputGlassTint),
+                in: RoundedRectangle(cornerRadius: 22)
+            )
+        } else {
+            content.background(theme.userBubble, in: RoundedRectangle(cornerRadius: 22))
+        }
+    }
+}
+
+private struct SendGlassBackgroundModifier: ViewModifier {
+    @Environment(\.naomiTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.glassEffect(
+                .regular.tint(theme.buttonGlassTint).interactive(),
+                in: Circle()
+            )
+        } else {
+            content.background(theme.userBubble, in: Circle())
+        }
+    }
+}
+
+private struct TitleGlassBackgroundModifier: ViewModifier {
+    @Environment(\.naomiTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.glassEffect(
+                .regular.tint(theme.titleGlassTint).interactive(),
+                in: Capsule()
+            )
+        } else {
+            content.background(theme.userBubble, in: Capsule())
+        }
+    }
+}
+
 private extension View {
     // Фон поля ввода: родное «жидкое стекло» iOS 26 — ровно тот же эффект,
     // что у системных кнопок в шапке (шестерёнки), поле не выделяется из
     // общего стиля. На старых iOS — прежний матовый пузырь.
-    @ViewBuilder
     func inputGlassBackground() -> some View {
-        if #available(iOS 26.0, *) {
-            self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22))
-        } else {
-            self.background(Color.naomiBubble, in: RoundedRectangle(cornerRadius: 22))
-        }
+        modifier(InputGlassBackgroundModifier())
     }
 
     // Кнопка отправки — то же стекло, круглая; interactive даёт родной отклик
     // на нажатие (блик и продавливание, как у системных стеклянных кнопок).
-    @ViewBuilder
     func sendGlassBackground() -> some View {
-        if #available(iOS 26.0, *) {
-            self.glassEffect(.regular.interactive(), in: Circle())
-        } else {
-            self.background(Color.naomiBubble, in: Circle())
-        }
+        modifier(SendGlassBackgroundModifier())
     }
 
     // Дно ленты — системному якорю, двумя ролями (iOS 18+):
@@ -1927,13 +2262,8 @@ private extension View {
 
     // «Облачко» надписи в шапке — стеклянная капсула, как у кнопок ниже; interactive
     // даёт родной отклик на нажатие (облачко — кнопка настроек). Фолбэк — матовый пузырь.
-    @ViewBuilder
     func titleGlassBackground() -> some View {
-        if #available(iOS 26.0, *) {
-            self.glassEffect(.regular.interactive(), in: Capsule())
-        } else {
-            self.background(Color.naomiBubble, in: Capsule())
-        }
+        modifier(TitleGlassBackgroundModifier())
     }
 
     // Датчики прокрутки — общий порог «у дна» 150 пт.
@@ -1947,7 +2277,7 @@ private extension View {
     // На старых iOS не отслеживаем: якорь вечно цел, дно вечно «рядом» — как раньше.
     @ViewBuilder
     func trackScroll(nearBottom: Binding<Bool>, handScrolled: Binding<Bool>,
-                     keyboardDragging: Binding<Bool>) -> some View {
+                     keyboardDragging: Binding<Bool>, isIdle: Binding<Bool>) -> some View {
         if #available(iOS 18.0, *) {
             self
                 .onScrollGeometryChange(for: Bool.self) { geo in
@@ -1956,6 +2286,7 @@ private extension View {
                     nearBottom.wrappedValue = isNear
                 }
                 .onScrollPhaseChange { _, newPhase, context in
+                    isIdle.wrappedValue = newPhase == .idle
                     // Жест окна и ScrollView начинают одновременно. Пока Telegram-
                     // жест ведёт клавиатуру, не даём его служебным фазам сорвать
                     // автопрокруточный якорь стрима.
@@ -1969,6 +2300,24 @@ private extension View {
                         }
                     }
                 }
+        } else {
+            self
+        }
+    }
+
+    // Живое расстояние до дна — зеркалом в коробку возврата (ChatScrollPinBox), мимо
+    // @State: пишется каждым кадром прокрутки, перерисовок не дёргает. Нужно мосту
+    // клавиатурного жеста в момент КАСАНИЯ («началось ли оно у дна») — булевы состояния
+    // с порогом 150 для этого слишком грубы. Старые iOS — без датчика: в коробке
+    // остаётся «бесконечно далеко», и возврат к дну просто не включается.
+    @ViewBuilder
+    func trackBottomDistance(into box: ChatScrollPinBox) -> some View {
+        if #available(iOS 18.0, *) {
+            self.onScrollGeometryChange(for: CGFloat.self) { geo in
+                geo.contentSize.height - geo.visibleRect.maxY
+            } action: { _, distance in
+                box.distanceToBottom = distance
+            }
         } else {
             self
         }
@@ -1996,6 +2345,7 @@ private extension View {
 // ── Пузырь сообщения ──
 
 struct MessageBubble: View {
+    @Environment(\.naomiTheme) private var theme
     let message: ChatMessage
     var onTapImage: (String) -> Void = { _ in }
 
@@ -2026,8 +2376,7 @@ struct MessageBubble: View {
             } else {
                 Text(message.text)
                     .font(.system(size: naomiChipFontSize))
-                    .foregroundStyle(.secondary)
-                    .opacity(0.75)   // завершённый шаг тише активного (act-done из веба)
+                    .foregroundStyle(theme.completedActionText)
                     .contentTransition(.opacity)
             }
             Spacer(minLength: 48)
@@ -2049,10 +2398,10 @@ struct MessageBubble: View {
                     if !message.text.isEmpty {
                         Text(markdownText)
                             .font(.system(size: naomiChatFontSize))
-                            .foregroundStyle(Color.primary)
+                            .foregroundStyle(theme.primaryText)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 10)
-                            .background(Color.naomiBubble, in: RoundedRectangle(cornerRadius: 18))
+                            .background(theme.userBubble, in: RoundedRectangle(cornerRadius: 18))
                     }
                 }
             }
@@ -2077,8 +2426,7 @@ struct MessageBubble: View {
                         }
                     }
                     .font(.system(size: naomiChatFontSize))
-                    .foregroundStyle(Color.primary)
-                    .opacity(message.isError ? 0.7 : 1)
+                    .foregroundStyle(message.isError ? theme.errorText : theme.primaryText)
                 }
             }
             .padding(.vertical, 4)
@@ -2171,28 +2519,40 @@ private struct WordFadeRenderer: TextRenderer {
 // покадрово (withAnimation тут не годится: repeatForever не пересчитал бы ход при
 // смене подписи, а contentTransition-морф текста живёт своей жизнью под волной).
 // Общая для плашек дел в ленте и надписи «Наоми» в шапке (когда она думает).
-extension View {
-    // По умолчанию — пресет плашек дел (период 2.2 с, мягкий луч с минимумом 36 пт).
-    // Шапка зовёт со своими: короткому слову «Наоми» луч в 36 пт — почти во всю
-    // ширину, «бега» не видно, поэтому там луч уже, ярче и период короче.
-    func naomiShimmer(period: Double = 2.2, minBand: CGFloat = 36, peak: Double = 0.85) -> some View {
-        overlay {
+private struct NaomiShimmerModifier: ViewModifier {
+    @Environment(\.naomiTheme) private var theme
+    let period: Double
+    let minBand: CGFloat
+    let peak: Double
+
+    func body(content: Content) -> some View {
+        content.overlay {
             TimelineView(.animation) { context in
                 GeometryReader { geo in
                     let phase = (context.date.timeIntervalSinceReferenceDate / period)
                         .truncatingRemainder(dividingBy: 1)
                     let band = max(geo.size.width * 0.45, minBand)   // ширина «луча»
                     LinearGradient(
-                        colors: [.clear, Color.primary.opacity(peak), .clear],
+                        colors: [.clear, theme.primaryText.opacity(peak), .clear],
                         startPoint: .leading, endPoint: .trailing
                     )
                     .frame(width: band)
                     .offset(x: -band + (geo.size.width + band) * phase)
                 }
             }
-            .mask(self)
+            .mask(content)
             .allowsHitTesting(false)
         }
+    }
+}
+
+extension View {
+    // По умолчанию — пресет плашек дел (период 2.2 с, мягкий луч с минимумом 36 пт).
+    // Шапка зовёт со своими: короткому слову «Наоми» луч в 36 пт — почти во всю
+    // ширину, «бега» не видно, поэтому там луч уже, ярче и период короче.
+    func naomiShimmer(period: Double = 2.2, minBand: CGFloat = 36,
+                      peak: Double = 0.85) -> some View {
+        modifier(NaomiShimmerModifier(period: period, minBand: minBand, peak: peak))
     }
 }
 
@@ -2216,12 +2576,13 @@ struct ShimmerIf: ViewModifier {
 
 // Живая подпись дела: приглушённый текст плашки + волна поверх.
 private struct ShimmerText: View {
+    @Environment(\.naomiTheme) private var theme
     let text: String
 
     var body: some View {
         Text(text)
             .font(.system(size: naomiChipFontSize))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(theme.secondaryText)
             .contentTransition(.opacity)
             .naomiShimmer()
     }
@@ -2229,13 +2590,14 @@ private struct ShimmerText: View {
 
 // Три точки «Наоми думает»: бегущая волна прозрачности.
 struct TypingDots: View {
+    @Environment(\.naomiTheme) private var theme
     @State private var phase = 0
 
     var body: some View {
         HStack(spacing: 5) {
             ForEach(0..<3, id: \.self) { i in
                 Circle()
-                    .fill(Color.secondary)
+                    .fill(theme.secondaryText)
                     .frame(width: 7, height: 7)
                     .opacity(phase == i ? 1 : 0.3)
                     .scaleEffect(phase == i ? 1 : 0.7)
@@ -2250,6 +2612,6 @@ struct TypingDots: View {
     }
 }
 
-#Preview {
-    ChatView()
+#Preview("Чат без сети") {
+    ChatView(previewMode: true)
 }
