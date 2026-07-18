@@ -37,11 +37,13 @@ private enum InteractiveKeyboardFinish {
 // Core Animation, а поле ввода — через SwiftUI.
 private enum InteractiveKeyboardMotion {
     static let mass: Double = 1
-    // Та же форма пружины, но примерно на 20% спокойнее прежней 340/31.
-    // Отношение damping / sqrt(stiffness) сохранено: финал стал медленнее,
-    // не превратившись при этом в резиновый отскок.
+    // КРИТИЧЕСКОЕ демпфирование: damping = 2·√(stiffness·mass) = 2·√240 ≈ 31. Прежние
+    // 26 были недодемпфированы — пружина у финала чуть перелетала и откатывалась, и за
+    // ней вверх «отстреливали» облачко ввода и приклеенный к нему чат. При критическом
+    // финал приходит в точку покоя МОНОТОННО, без перелёта — отстрела нет. Скорость
+    // финала почти та же (settling ≈ прежний), уходит только пружинистый хвостик.
     static let stiffness: Double = 240
-    static let damping: Double = 26
+    static let damping: Double = 31
 
     static func normalizedVelocity(_ rawVelocity: CGFloat) -> Double {
         max(-4, min(4, Double(rawVelocity / 1_000)))
@@ -136,7 +138,9 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
     // ещё ничего не утащил: к концу жеста прокрутка уже уехала, и по ней не понять,
     // был ли это «закрой клавиатуру от последнего ответа» или листание истории.
     let chatAtBottom: () -> Bool
-    let onBegin: () -> Void
+    let onStick: (Bool) -> Void     // касание: Bool — у дна ли (пора приклеивать ленту)
+    let onStickCancel: () -> Void   // жест не стал скрытием — снять приклейку, вернуть скролл
+    let onBegin: () -> Void         // палец реально повёл клавиатуру (живой drag)
     let onOffset: (CGFloat) -> Void
     let onFinish: (InteractiveKeyboardFinish, CGFloat, Bool) -> Void
     let onAnimationComplete: (InteractiveKeyboardFinish) -> Void
@@ -182,6 +186,8 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
         private var keyboardHeight: CGFloat = 0
         private var chatAtBottom: () -> Bool = { false }
         private var startedAtBottom = false
+        private var onStick: (Bool) -> Void = { _ in }
+        private var onStickCancel: () -> Void = {}
         private var onBegin: () -> Void = {}
         private var onOffset: (CGFloat) -> Void = { _ in }
         private var onFinish: (InteractiveKeyboardFinish, CGFloat, Bool) -> Void = { _, _, _ in }
@@ -207,6 +213,8 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
             inputFocused = bridge.inputFocused
             keyboardHeight = bridge.keyboardHeight
             chatAtBottom = bridge.chatAtBottom
+            onStick = bridge.onStick
+            onStickCancel = bridge.onStickCancel
             onBegin = bridge.onBegin
             onOffset = bridge.onOffset
             onFinish = bridge.onFinish
@@ -280,8 +288,11 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
             keyboardTop = frame.minY
             activeKeyboardHeight = height
             moved = false
-            // Снимок «у дна» — ровно в момент касания, до первого сдвига пальца.
+            // Снимок «у дна» — ровно в момент касания, до первого сдвига пальца. И сразу
+            // приклеиваем: с этого мгновения лента у дна не листается (прокрутка off),
+            // а только ведёт клавиатуру — разгоняться по пути к ней нечему.
             startedAtBottom = chatAtBottom()
+            onStick(startedAtBottom)
         }
 
         private func moveTracking(to point: CGPoint) {
@@ -301,6 +312,9 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
 
         private func endTracking(at point: CGPoint, velocity: CGPoint?) {
             guard moved, let keyboardView, let originalBounds, startPoint != nil else {
+                // Палец коснулся, но клавиатуру так и не повёл (тап, короткий тык): жеста
+                // скрытия нет — снимаем приклейку, возвращаем ленте обычную прокрутку.
+                onStickCancel()
                 self.keyboardView = nil
                 self.originalBounds = nil
                 startPoint = nil
@@ -514,94 +528,73 @@ private struct TelegramKeyboardPanBridge: UIViewRepresentable {
     }
 }
 
-// Возврат ленты к дну после жеста-скрытия клавиатуры, начатого у дна. Такой свайп —
-// это ещё и обычный pan ленты: палец успевает утащить чат в историю, а инерция после
-// отпускания везёт дальше — последний ответ уезжает под облачко ввода. Если жест
-// НАЧАЛСЯ у дна, финал должен быть тем же дном: инерцию глушим и ведём офсет к нижней
-// границе той же физикой, что финал клавиатуры (жёсткость семьи 240, демпфер
-// критический — приезд без отскока, никаких видимых пружин). Цель пересчитывается
-// КАЖДЫЙ кадр по живой геометрии: параллельно режется резерв ленты (chatReserveCut),
-// стрим может дописывать строки — а якорь sizeChanges сдвигает офсет и цель на одну
-// и ту же величину, так что пружина этих перестроек даже не чувствует. Рука главнее:
-// новое касание ленты (isTracking) или фокус поля — и возврат молча отменяется.
+// Приклеивание ленты к клавиатуре на жесте-скрытии, начатом у дна («приклеить намертво»).
+// Раньше лента и клавиатура были ДВА независимых движения одного пальца — лента листалась
+// своим pan, клавиатуру вёл мост, — и любой доводчик сшивал их постфактум, из другого
+// таймлайна, отчего на стыке был рывок. Теперь совсем просто: как только палец у дна
+// КОСНУЛСЯ ленты, её прокрутка ВЫКЛЮЧАЕТСЯ (isScrollEnabled=false) — палец не листает и
+// не разгоняет ленту, а лишь ведёт клавиатуру (мост слушает окно, не scrollView). Пока
+// держатель жив, лента каждый кадр просто садится на «дно», которое поднимается вслед за
+// уезжающим резервом, — она приклеена к клавиатуре и едет с ней единым куском на ЕЁ
+// пружине (InteractiveKeyboardMotion, теперь критической — без перелёта, значит и без
+// отстрела). Ни своей пружины, ни зазора, ни монотонных клампов у ленты нет. Рука
+// (isTracking) или фокус/отправка — держатель снимается, прокрутка возвращается.
 private final class ChatScrollPinBox: NSObject {
     // Живое расстояние видимого низа до конца контента — зеркалится каждым кадром
     // прокрутки (см. trackBottomDistance) в поле класса, мимо @State: перерисовок
-    // не дёргает. Стартовое «бесконечно далеко» = на iOS без датчика (<18) возврат
+    // не дёргает. Стартовое «бесконечно далеко» = на iOS без датчика (<18) держатель
     // просто никогда не включается.
     var distanceToBottom: CGFloat = .greatestFiniteMagnitude
     weak var scrollView: UIScrollView?
 
     private var displayLink: CADisplayLink?
-    private var velocity: CGFloat = 0
-    private var lastTick: CFTimeInterval = 0
     private var onSettled: (() -> Void)?
 
-    private let stiffness: CGFloat = 240   // семья InteractiveKeyboardMotion
-    private let damping: CGFloat = 31      // ≈ 2·√240 — критическое, без перелёта
-
-    // fingerVelocity — настоящая скорость пальца (pt/s, вниз положительная). Палец
-    // вёл контент вниз — офсет летел в минус: отдаём пружине ту же скорость, чтобы
-    // остановка была продолжением движения (чуть донесёт и мягко вернёт), а не ступенькой.
-    func pin(fingerVelocity: CGFloat, onSettled: @escaping () -> Void) {
-        guard scrollView != nil else { return }
+    // Приклеить с КАСАНИЯ и держать весь жест: выключаем прокрутку и каждый кадр сажаем
+    // ленту на дно (см. step). Прокрутку глушим у источника — без борьбы pan с офсетом.
+    func beginHold(onSettled: @escaping () -> Void) {
+        guard let scrollView else { return }
         cancel()
         self.onSettled = onSettled
-        velocity = -min(max(fingerVelocity, -3000), 3000)
-        stopDeceleration()
-        lastTick = CACurrentMediaTime()
+        scrollView.isScrollEnabled = false
         let link = CADisplayLink(target: self, selector: #selector(step))
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
 
+    // Клавиатура доехала (или вернулась): досадить ленту ровно на дно и отпустить.
+    func endHold() {
+        guard displayLink != nil else { return }
+        if let scrollView {
+            scrollView.contentOffset.y = bottomTarget(scrollView)
+        }
+        let done = onSettled
+        cancel()
+        done?()
+    }
+
     func cancel() {
+        scrollView?.isScrollEnabled = true   // вернуть ленте обычную прокрутку
         displayLink?.invalidate()
         displayLink = nil
         onSettled = nil
     }
 
-    // Классический публичный способ заглушить инерцию: «остановись на текущем месте».
-    private func stopDeceleration() {
-        guard let scrollView, scrollView.isDecelerating else { return }
-        scrollView.setContentOffset(scrollView.contentOffset, animated: false)
+    // «Дно» ленты: максимальный contentOffset с учётом текущего резерва. Он поднимается,
+    // пока клавиатурный резерв (safeAreaInset снизу) съезжает вслед за клавиатурой.
+    private func bottomTarget(_ sv: UIScrollView) -> CGFloat {
+        let inset = sv.adjustedContentInset
+        return max(-inset.top, sv.contentSize.height + inset.bottom - sv.bounds.height)
     }
 
     @objc private func step(_ link: CADisplayLink) {
         guard let scrollView, !scrollView.isTracking else {
-            cancel()   // лента исчезла или её снова взяли рукой — палец главнее
+            cancel()   // рука снова взяла ленту — палец главнее держателя
             return
         }
-        // Порядок окончания жестов окна и ленты не гарантирован: системная инерция
-        // могла стартовать уже ПОСЛЕ pin — глушим её, как только замечаем.
-        stopDeceleration()
-
-        let now = CACurrentMediaTime()
-        let dt = CGFloat(min(now - lastTick, 1.0 / 30))   // крышка на случай подвиса кадров
-        lastTick = now
-
-        let inset = scrollView.adjustedContentInset
-        let minOffset = -inset.top
-        let target = max(
-            minOffset,
-            scrollView.contentSize.height + inset.bottom - scrollView.bounds.height
-        )
-        // Отклонение пересчитываем от ЖИВОГО офсета: чужие сдвиги (якорь sizeChanges
-        // при срезе резерва) не копятся в ошибку, пружина продолжает от факта.
-        var x = scrollView.contentOffset.y - target
-        let acceleration = -stiffness * x - damping * velocity
-        velocity += acceleration * dt
-        x += velocity * dt
-
-        if abs(x) < 0.5, abs(velocity) < 12 {
-            scrollView.contentOffset.y = target
-            let done = onSettled
-            cancel()
-            done?()
-            return
-        }
-        // Кламп сверху: за дно (под облачко ввода) не заезжаем ни на кадр.
-        scrollView.contentOffset.y = min(max(target + x, minOffset), target)
+        // Просто садимся на дно. Резерв (и с ним дно) ведёт критическая пружина клавиатуры
+        // монотонно — значит лента едет к финалу монотонно, без отстрела.
+        scrollView.contentOffset.y = bottomTarget(scrollView)
     }
 }
 
@@ -832,9 +825,10 @@ struct ChatView: View {
     @State private var keyboardDragOffset: CGFloat = 0
     @State private var keyboardDragging = false
     @State private var keyboardResetGeneration = 0
-    // В финале dismiss резерв ленты отрезается одинаково при любой позиции чата.
-    // Отдельной ветки для последнего ответа намеренно нет: она вмешивалась в живой
-    // pan UIScrollView и отстреливала ленту вверх, когда палец заходил на клавиатуру.
+    // Мгновенный срез нижнего резерва ленты в финале dismiss — но ТОЛЬКО из глубины
+    // истории (где приклеивания нет): геометрия замирает, инерция листания течёт по ней
+    // без подфриза. У дна резерв съезжает плавно, а держатель приклеивает ленту к
+    // поднимающемуся дну. Живёт только между отпусканием и настоящим didHide, где снимается.
     @State private var chatReserveCut = false
     // Читаем один раз после первого layout. Нельзя обращаться к window.safeAreaInsets
     // из computed property body: safeAreaBar сам рассчитывает этот inset и образует
@@ -941,6 +935,11 @@ struct ChatView: View {
                     keyboardHeight: keyboardHeight,
                     resetGeneration: keyboardResetGeneration,
                     chatAtBottom: { scrollPin.distanceToBottom < chatBottomPinThreshold },
+                    onStick: { atBottom in
+                        // У дна — приклеиваем ленту к клавиатуре с касания (прокрутка off).
+                        if atBottom { scrollPin.beginHold { scrolledAwayByHand = false } }
+                    },
+                    onStickCancel: { scrollPin.cancel() },
                     onBegin: beginInteractiveKeyboardDrag,
                     onOffset: updateInteractiveKeyboardDrag,
                     onFinish: finishInteractiveKeyboardDrag,
@@ -1159,9 +1158,9 @@ struct ChatView: View {
             }
             .onChange(of: inputFocused) { _, focused in
                 guard focused else { return }
-                // Фокус поля — рука главнее возврата к дну после жеста-скрытия: если
-                // пружина ChatScrollPinBox ещё едет, офсет дальше ведут клавиатура и
-                // системный якорь, двум водителям тут не место.
+                // Фокус поля — рука главнее приклеивания: если держатель ещё активен,
+                // офсет дальше ведут клавиатура и системный якорь, двум водителям тут
+                // не место.
                 scrollPin.cancel()
                 // Тап в поле, пока лента пружинит у дна: системная инерция ведёт офсет
                 // к СТАРОМУ дну (посчитанному до клавиатуры) и перебивает коррекцию
@@ -1234,8 +1233,8 @@ struct ChatView: View {
     }
 
     private func beginInteractiveKeyboardDrag() {
-        // Только помечаем живой keyboard-drag. Позицию и инерцию самой ленты здесь
-        // не меняем — у последнего ответа действует тот же путь, что в истории.
+        // Палец реально повёл клавиатуру. Приклейка ленты уже запущена с касания (onStick),
+        // здесь лишь помечаем живой drag — чтобы датчики прокрутки не сорвали автопрокрутку.
         var transaction = Transaction()
         transaction.animation = nil
         withTransaction(transaction) {
@@ -1254,10 +1253,12 @@ struct ChatView: View {
     private func finishInteractiveKeyboardDrag(_ finish: InteractiveKeyboardFinish,
                                                initialVelocity: CGFloat,
                                                startedAtBottom: Bool) {
-        if finish == .dismiss {
-            // Один путь для любой позиции ленты, включая последний ответ: конечный
-            // размер применяется разом, без отдельного удержания хвоста, клампа
-            // contentOffset или принудительного scrollToBottom.
+        // Мгновенный срез резерва — ТОЛЬКО для скрытия из ГЛУБИНЫ истории (держатель там
+        // не работает): геометрия замирает, инерция листания течёт по ней без подфриза.
+        // У дна резерв НЕ режем — он должен плавно съезжать по keyboardDragOffset, а
+        // держатель каждый кадр сажает ленту на поднимающееся дно (лента приклеена к
+        // клавиатуре). Мгновенный срез там разорвал бы приклейку скачком дна.
+        if finish == .dismiss, !startedAtBottom {
             var transaction = Transaction()
             transaction.animation = nil
             withTransaction(transaction) {
@@ -1265,22 +1266,11 @@ struct ChatView: View {
             }
         }
 
-        // Поле доигрывает пружину отдельно; геометрия самой ленты уже конечная и
-        // больше не вмешивается в её живую прокрутку или инерцию.
+        // Клавиатура (панель, резерв) доигрывает пружину сама. У дна за ней жёстко
+        // следует приклеенная лента (держатель по bottomTarget) — единым куском, на
+        // инерции ИМЕННО этой пружины, без своей второй анимации у ленты.
         withAnimation(InteractiveKeyboardMotion.animation(initialVelocity: initialVelocity)) {
             keyboardDragOffset = finish == .dismiss ? inputBarTravelDistance : 0
-        }
-
-        // Жест начался у самого дна и кончился скрытием: это был «закрой клавиатуру»,
-        // а не «листай историю» — но pan ленты и инерция уже утащили чат от дна.
-        // Возврат ведёт ChatScrollPinBox: глушит инерцию и той же пружинной семьёй
-        // сажает последний ответ над облачком ввода. Мост отдаёт скорость пальца
-        // приглушённой в 5 раз (формула Telegram) — возвращаем настоящие pt/s.
-        // Из глубины истории (startedAtBottom == false) не трогаем ничего.
-        if finish == .dismiss, startedAtBottom {
-            scrollPin.pin(fingerVelocity: initialVelocity * 5) {
-                scrolledAwayByHand = false   // финал у дна — якорь автопрокрутки снова цел
-            }
         }
     }
 
@@ -1291,6 +1281,9 @@ struct ChatView: View {
             keyboardDragOffset = finish == .dismiss ? inputBarTravelDistance : 0
             keyboardDragging = false
         }
+        // Клавиатура доехала до конца (скрылась или вернулась) — отпускаем держатель,
+        // досадив ленту ровно на финальное дно. До этого момента лента ехала приклеенной.
+        scrollPin.endHold()
     }
 
     // Финал жеста-скрытия: клавиши в этот момент уже за низом экрана (слой увёз
@@ -1935,7 +1928,7 @@ struct ChatView: View {
         // Отправка перевзводит якорь: свой ход везёт чат вниз из любой глубины
         // переписки (guard на новые ряды теперь смотрит только на якорь, не на sending).
         scrolledAwayByHand = false
-        scrollPin.cancel()   // отправка сама везёт к дну — возврат-пружине тут делать нечего
+        scrollPin.cancel()   // отправка сама везёт к дну — держателю приклейки тут делать нечего
         // Окно ленты — обратно к базе: после чтения старой переписки оно разрастается
         // (по +80 за подгрузку) и НЕ сжимается само, а большое окно возвращает тяжёлый
         // покадровый пересчёт при движении клавиатуры. Отправка и так везёт чат на дно,
